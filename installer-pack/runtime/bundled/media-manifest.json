@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "packId": "codex-starter",
+  "platform": "win_amd64",
+  "python": "cpython-312",
+  "media": [
+    {
+      "id": "runtime.python312",
+      "path": "runtime/bundled/python-3.12.10-amd64.exe",
+      "kind": "windows-installer",
+      "source": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe",
+      "sha256": "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb",
+      "bytes": 26964224,
+      "signature": "Authenticode Valid; signer Python Software Foundation",
+      "install": "per-user Python 3.12.10 installer; no system PATH modification"
+    },
+    {
+      "id": "runtime.feishu-mcp-package",
+      "path": "runtime/bundled/feishu-node-modules.zip",
+      "kind": "npm-offline-closure",
+      "source": "https://registry.npmjs.org/@larksuiteoapi/lark-mcp/-/lark-mcp-0.5.1.tgz",
+      "sha256": "cbf988b8a1f1b9da7e8df418755b68d052961ff7e06881d4097dabbe76c36b9d",
+      "bytes": 12898130,
+      "package": "@larksuiteoapi/lark-mcp@0.5.1",
+      "packageCount": 195,
+      "install": "extract node_modules and package-lock.json to the per-user Feishu runtime cache"
+    },
+    {
+      "id": "runtime.node22-common",
+      "path": "runtime/bundled/node-v22.22.0-win-x64.zip",
+      "kind": "runtime-zip",
+      "source": "https://nodejs.org/dist/v22.22.0/node-v22.22.0-win-x64.zip",
+      "checksumSource": "https://nodejs.org/dist/v22.22.0/SHASUMS256.txt",
+      "sha256": "c97fa376d2becdc8863fcd3ca2dd9a83a9f3468ee7ccf7a6d076ec66a645c77a",
+      "bytes": 35556852,
+      "signature": "Official Node.js SHASUMS256.txt; ZIP has no Authenticode signature",
+      "install": "Extract per-user as the shared Node 22 runtime for HyperFrames and Feishu."
+    },
+    {
+      "id": "runtime.ffmpeg-windows-x64",
+      "path": "runtime/bundled/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+      "kind": "runtime-zip",
+      "source": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip",
+      "sourceProject": "https://github.com/BtbN/FFmpeg-Builds",
+      "sha256": "3f67595fb8c7be0c48d8f54b2a5a89175426a6d7b194065d0c08cca9bd95eb19",
+      "bytes": 77221060,
+      "license": "FFmpeg LGPL build (shared); see runtime/THIRD-PARTY-NOTICES.md",
+      "install": "Extract ffmpeg.exe, ffprobe.exe, ffplay.exe and companion DLLs into the per-user Codex Agent Kit runtime."
+    },
+    {
+      "id": "runtime.hyperframes-package-json",
+      "path": "runtime/bundled/hyperframes-package.json",
+      "kind": "npm-lock-contract",
+      "source": "https://registry.npmjs.org/hyperframes/0.8.134",
+      "sha256": "907747a9d9adfb41244fe8dfc3786d929c6b2261813ca509c58cf4429b88ee11",
+      "bytes": 147,
+      "install": "Copied into the per-user HyperFrames runtime as the contract for the bundled Windows x64 dependency closure."
+    },
+    {
+      "id": "runtime.hyperframes-package-lock",
+      "path": "runtime/bundled/hyperframes-package-lock.json",
+      "kind": "npm-lock-contract",
+      "source": "https://registry.npmjs.org/",
+      "sha256": "e6d58048a953a40e40df4cce287f45f2027ca38b750e0e6a45d68f48a80255d9",
+      "bytes": 62115,
+      "install": "Copied into the per-user HyperFrames runtime as the contract for the bundled Windows x64 dependency closure."
+    },
+    {
+      "id": "runtime.hyperframes-browser",
+      "path": "runtime/bundled/chrome-headless-shell-152.0.7977.30-win64.zip",
+      "kind": "runtime-zip",
+      "version": "152.0.7977.30",
+      "source": "https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.30/win64/chrome-headless-shell-win64.zip",
+      "sha256": "5d7df999a6e4a65a1b16b25b61064f7337b8aa8ee2ed1b4e07bfdd24f6e4275e",
+      "bytes": 119527247,
+      "license": "Archive includes LICENSE.headless_shell and ABOUT; retain the complete archive contents.",
+      "install": "Extract privately into runtime/hyperframes-browser/152.0.7977.30; hyperframes.cmd supplies HYPERFRAMES_BROWSER_PATH for installation checks and rendering."
+    },
+    {
+      "id": "runtime.hyperframes-cli",
+      "path": "runtime/bundled/hyperframes-0.8.134-win-x64-node-modules.zip",
+      "kind": "npm-offline-closure",
+      "source": "https://registry.npmjs.org/hyperframes/0.8.134",
+      "package": "hyperframes@0.8.134",
+      "packageCount": 74,
+      "sha256": "f004bbef828259756d39790ff315d4887441119f325a7fb54e94781c49785efa",
+      "bytes": 38311252,
+      "license": "Preserve all LICENSE/NOTICE files from the locked dependency tree; see runtime/THIRD-PARTY-NOTICES.md.",
+      "install": "Extract locked Windows x64 node_modules into the private HyperFrames runtime; no npm download on the target machine."
+    },
+    {
+      "id": "runtime.hyperframes-ffmpeg",
+      "path": "runtime/bundled/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip",
+      "kind": "runtime-zip",
+      "source": "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip",
+      "checksumSource": "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/latest/checksums.sha256",
+      "sha256": "b45094c0154a50834c4b510e565f11563327bb927049df3c6821ecd9490c05a0",
+      "bytes": 85871623,
+      "license": "GPL shared build, for the HyperFrames libx264 consumer only; retain the complete archive and its licenses.",
+      "install": "Extract into private runtime/hyperframes-ffmpeg; bind only the HyperFrames command shim. The general LGPL FFmpeg remains unchanged."
+    }
+  ],
+  "pythonWheelhouse": {
+    "manifest": "runtime/bundled/python-wheelhouse-manifest.json",
+    "lock": "runtime/bundled/python-requirements.lock",
+    "directory": "runtime/bundled/python-wheels",
+    "wheelCount": 77,
+    "bytes": 167504800,
+    "hashPolicy": "Every wheel has a SHA-256 and exact byte count in the wheelhouse manifest; pip installs with --require-hashes.",
+    "healthCheck": "Base Python imports pass; isolated manim-env installs manim==0.21.0 from hashed local wheels.",
+    "additionalLock": "runtime/bundled/manim-requirements.lock"
+  },
+  "secretsPolicy": "No credentials are bundled. Feishu and direct HTTP APIs require first-run user configuration and remain disabled until health checks pass.",
+  "manim": {
+    "version": "0.21.0",
+    "lock": "runtime/bundled/manim-requirements.lock",
+    "wheelhouse": "runtime/bundled/python-wheels",
+    "environment": "per-user isolated CPython 3.12 venv",
+    "healthCheck": "CODEX_MANIM_PYTHON -c \"import manim\""
+  },
+  "optionalLatex": {
+    "name": "MiKTeX",
+    "requiredFor": "Manim Tex/MathTex formula rendering only",
+    "required": false,
+    "note": "Manim basic scenes render without a system TeX distribution; install/configure MiKTeX only when formula rendering is requested."
+  }
+}

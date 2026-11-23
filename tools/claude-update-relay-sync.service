@@ -1,0 +1,17 @@
+[Unit]
+Description=Publish paired Claude Desktop and Code updates
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=codexrelay
+Group=codexrelay
+ExecStart=/usr/bin/python3 /usr/local/libexec/claude-update-relay-sync.py
+ReadWritePaths=/srv/codex-update-relay/export/claude
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0022
+TimeoutStartSec=2h

@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 2,
+  "kind": "direct-http-api-services-only",
+  "policy": "These are HTTP/API adapters, not MCP servers. Credentials stay outside the pack. Image/video generation is handled by the unified media MCP.",
+  "services": [
+    {
+      "id": "dashscope-web-search",
+      "status": "guided-config",
+      "protocol": "https-json",
+      "baseUrlField": "dashscope.base-url",
+      "defaultUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "path": "/chat/completions",
+      "credentialFields": [
+        "dashscope.api-key"
+      ],
+      "configurationFields": [
+        "dashscope.base-url",
+        "dashscope.model"
+      ],
+      "relatedSkills": [
+        "web-search-extraction"
+      ],
+      "healthCheck": "Run web_search.py --json with a non-sensitive test query; missing credentials must fail before network I/O.",
+      "enableWhen": [
+        "dashscope.api-key",
+        "dashscope.base-url",
+        "dashscope.model",
+        "capability.network"
+      ],
+      "failureMessage": "未配置 DashScope 时优先使用 Codex 原生网页能力；不要把 API 适配器伪装成 MCP。",
+      "disableRule": "Unset the credential or set the service enabled flag to false in the private connection store."
+    }
+  ]
+}

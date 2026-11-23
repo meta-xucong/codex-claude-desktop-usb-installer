@@ -1,0 +1,210 @@
+name: CI
+
+# Fast pull-request gate: type-check, unit tests and a cross-platform Rust
+# clippy/test pass. The heavy signed/notarized bundle build stays in
+# the default-branch release.yml (signalled by v* tags) — this never builds or
+# signs the .app.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Newer pushes to the same ref supersede in-flight runs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Select scoped checks
+    runs-on: ubuntu-latest
+    outputs:
+      windows_engine: ${{ steps.filter.outputs.windows_engine }}
+      theme_engine: ${{ steps.filter.outputs.theme_engine }}
+      dependencies: ${{ steps.filter.outputs.dependencies }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Classify changed files
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$PR_BASE_SHA" ]]; then
+            base="$PR_BASE_SHA"
+          else
+            base="$BEFORE_SHA"
+          fi
+          if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+            changed="$(git show --pretty=format: --name-only HEAD)"
+          else
+            changed="$(git diff --name-only "$base"...HEAD)"
+          fi
+
+          if grep -Eq '^crates/codex-win-engine/' <<<"$changed"; then
+            echo "windows_engine=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "windows_engine=false" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -Eq '^crates/codex-theme-engine/' <<<"$changed"; then
+            echo "theme_engine=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "theme_engine=false" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -Eq '(^|/)(Cargo\.lock|Cargo\.toml|package-lock\.json|pnpm-lock\.yaml|package\.json|deny\.toml)$|^\.cargo/' <<<"$changed"; then
+            echo "dependencies=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dependencies=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Type-check
+        run: npm run check
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests
+        run: npm run test --if-present
+      - name: Build frontend
+        run: npm run build
+
+  rust:
+    name: Rust
+    needs: changes
+    # The USB edition is Windows-only. macOS distribution support remains in
+    # release.yml, outside this Windows USB pull-request gate.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      # tauri-build (frontendDist: ../dist) reads the built frontend at compile
+      # time, so produce dist before touching cargo. We deliberately do NOT run
+      # `tauri build` here — no bundling, no signing, no notarization.
+      - name: Build frontend (for tauri-build)
+        run: npm run build
+      - name: Clippy (deny warnings)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings
+      - name: Test (src-tauri)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
+      # The standalone Windows engine suite includes AppX/WpSystem deployment
+      # fixture tests. Keep it, but only run it when that engine crate changes;
+      # unrelated model-manager changes must not be blocked by those fixtures.
+      - name: Test codex-win-engine (standalone)
+        if: needs.changes.outputs.windows_engine == 'true'
+        run: cargo test --manifest-path crates/codex-win-engine/Cargo.toml --all-targets
+      - name: Test codex-theme-engine (standalone)
+        if: needs.changes.outputs.theme_engine == 'true'
+        run: cargo test --manifest-path crates/codex-theme-engine/Cargo.toml --all-targets
+
+  audit:
+    name: Audit
+    needs: changes
+    # Dependency policy is checked when dependency manifests/lockfiles change;
+    # unrelated application code is not held up by the current yanked-zip audit notice.
+    if: needs.changes.outputs.dependencies == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+      - name: Audit npm lockfiles
+        run: |
+          npm audit --package-lock-only --audit-level=high
+          npm --prefix website audit --package-lock-only --audit-level=high
+          npm --prefix cloudflare/manager-download-router audit --package-lock-only --audit-level=high
+      - name: Install pinned Rust audit tools
+        run: |
+          cargo install cargo-audit --version 0.22.0 --locked
+          cargo install cargo-deny --version 0.18.9 --locked
+      - name: Audit Rust lockfiles
+        run: |
+          for lockfile in \
+            src-tauri/Cargo.lock \
+            crates/codex-mac-engine/Cargo.lock \
+            crates/codex-win-engine/Cargo.lock \
+            crates/codex-theme-engine/Cargo.lock
+          do
+            # Match deny.toml's exception for Tauri's transitive unic-common advisory.
+            cargo audit --ignore RUSTSEC-2025-0080 --file "$lockfile"
+          done
+      - name: Enforce Rust dependency policy
+        run: cargo deny --manifest-path src-tauri/Cargo.toml check
+
+  worker-test:
+    name: Cloudflare worker tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect Cloudflare changes
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_SHA" ]; then
+            git diff --name-only "$BASE_SHA" HEAD > changed-files.txt
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git diff --name-only "$BEFORE_SHA" HEAD > changed-files.txt || git show --name-only --format= HEAD > changed-files.txt
+          else
+            git show --name-only --format= HEAD > changed-files.txt
+          fi
+
+          if grep -q '^cloudflare/' changed-files.txt; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No cloudflare/** changes; skipping worker tests."
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        if: steps.changes.outputs.run == 'true'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cloudflare/manager-download-router/package-lock.json
+
+      - name: Install worker dependencies
+        if: steps.changes.outputs.run == 'true'
+        working-directory: cloudflare/manager-download-router
+        run: npm ci
+
+      - name: Run worker tests
+        if: steps.changes.outputs.run == 'true'
+        working-directory: cloudflare/manager-download-router
+        run: npm test

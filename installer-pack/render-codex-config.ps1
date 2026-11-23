@@ -1,0 +1,276 @@
+﻿[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string]$OutputPath,
+    [string]$SkillRoot,
+    [switch]$EnableFeishu,
+    [switch]$EnableMediaGeneration,
+    [string]$FeishuWrapperPath,
+    [string]$MediaMcpWrapperPath,
+    [string]$FeishuPackageCache,
+    [string]$PythonExe,
+    [string]$TargetUserProfile,
+    [string]$TargetCodexHome,
+    [ValidateSet('tenant','oauth','user')][string]$FeishuAuthMode = 'tenant',
+    [string]$FeishuDomain = 'https://open.feishu.cn',
+    [string[]]$EnableSkills = @(),
+    [string[]]$EnableRemoteMcps = @(),
+    [switch]$Overwrite
+)
+
+$ErrorActionPreference = 'Stop'
+
+function ConvertTo-TomlString([string]$Value) {
+    return '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"'
+}
+
+function Test-BundledPluginConfigured([string]$ConfigText, [string]$PluginId) {
+    if ([string]::IsNullOrWhiteSpace($ConfigText)) { return $false }
+    $pluginKey = $PluginId + '@openai-bundled'
+    $doubleQuotedId = [regex]::Escape('"' + $pluginKey + '"')
+    $singleQuotedId = [regex]::Escape("'" + $pluginKey + "'")
+    $pattern = '(?m)^\s*\[plugins\.(?:' + $doubleQuotedId + '|' + $singleQuotedId + ')(?:\.[^\]]+)?\]\s*(?:#.*)?$'
+    return [regex]::IsMatch($ConfigText, $pattern)
+}
+
+function Get-ManagedPluginEnabledValue([string]$ConfigText, [string]$TableHeader) {
+    if ([string]::IsNullOrWhiteSpace($ConfigText)) { return $null }
+    $pattern = '(?ms)^[ \t]*' + [regex]::Escape($TableHeader) + '[ \t]*\r?\n(?<body>.*?)(?=^[ \t]*\[|\z)'
+    $table = [regex]::Match($ConfigText, $pattern)
+    if (-not $table.Success) { return $null }
+    $enabled = [regex]::Match($table.Groups['body'].Value, '(?im)^[ \t]*enabled[ \t]*=[ \t]*(true|false)[ \t]*(?:#.*)?\r?$')
+    if (-not $enabled.Success) { return $null }
+    return $enabled.Groups[1].Value.ToLowerInvariant()
+}
+
+function Add-BundledPluginDefault([string]$PluginId, [string[]]$SectionLines, [string]$ExistingConfig) {
+    if (Test-BundledPluginConfigured $ExistingConfig $PluginId) {
+        [void]$script:preservedBundledPluginSettings.Add($PluginId)
+        return
+    }
+    $linesToAdd = @($SectionLines)
+    $preservedManagedDisable = $false
+    for ($index = 0; $index -lt $linesToAdd.Count; $index++) {
+        if ($linesToAdd[$index] -notmatch '^\[') { continue }
+        $previousValue = Get-ManagedPluginEnabledValue $script:existingManagedPluginConfig $linesToAdd[$index]
+        if ($previousValue -ne 'false') { continue }
+        for ($valueIndex = $index + 1; $valueIndex -lt $linesToAdd.Count; $valueIndex++) {
+            if ($linesToAdd[$valueIndex] -match '^\[') { break }
+            if ($linesToAdd[$valueIndex] -match '^\s*enabled\s*=\s*true\s*(?:#.*)?$') {
+                $linesToAdd[$valueIndex] = 'enabled = false'
+                $preservedManagedDisable = $true
+                break
+            }
+        }
+    }
+    foreach ($line in $linesToAdd) { $script:lines.Add($line) }
+    $script:lines.Add('')
+    if ($preservedManagedDisable) {
+        [void]$script:preservedBundledPluginSettings.Add($PluginId)
+    } else {
+        [void]$script:enabledBundledPlugins.Add($PluginId)
+    }
+}
+
+$scriptContainer = $PSScriptRoot
+$candidateRoot = Split-Path -Parent $scriptContainer
+if (Test-Path -LiteralPath (Join-Path $scriptContainer 'pack.json') -PathType Leaf) {
+    $kitRoot = $scriptContainer
+} elseif (Test-Path -LiteralPath (Join-Path $candidateRoot 'manifest\skill-audit.json') -PathType Leaf) {
+    $kitRoot = $candidateRoot
+} else {
+    throw 'Cannot locate the capability-kit root.'
+}
+
+$userProfile = $TargetUserProfile
+if ([string]::IsNullOrWhiteSpace($userProfile)) { $userProfile = [Environment]::GetEnvironmentVariable('USERPROFILE') }
+if ([string]::IsNullOrWhiteSpace($userProfile)) { throw 'USERPROFILE is required.' }
+if ([string]::IsNullOrWhiteSpace($TargetCodexHome)) { $TargetCodexHome = Join-Path $userProfile '.codex' }
+if ([string]::IsNullOrWhiteSpace($SkillRoot)) { $SkillRoot = Join-Path $userProfile '.agents\skills' }
+if ([string]::IsNullOrWhiteSpace($FeishuWrapperPath)) { $FeishuWrapperPath = Join-Path $TargetCodexHome 'codex-agent-kit\bin\start-feishu-mcp.ps1' }
+if ([string]::IsNullOrWhiteSpace($MediaMcpWrapperPath)) { $MediaMcpWrapperPath = Join-Path $TargetCodexHome 'codex-agent-kit\bin\start-media-generation-mcp.ps1' }
+if ([string]::IsNullOrWhiteSpace($FeishuPackageCache)) { $FeishuPackageCache = Join-Path $TargetCodexHome 'codex-agent-kit\runtime\feishu' }
+
+$auditPath = Join-Path $kitRoot 'manifest\skill-audit.json'
+$templatePath = Join-Path $kitRoot 'config-fragments\feishu-official-stdio.template.toml'
+$mediaTemplatePath = Join-Path $kitRoot 'config-fragments\media-generation-stdio.template.toml'
+if (-not (Test-Path -LiteralPath $auditPath -PathType Leaf)) { throw "Missing Skill audit: $auditPath" }
+if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) { throw "Missing Feishu template: $templatePath" }
+if (-not (Test-Path -LiteralPath $mediaTemplatePath -PathType Leaf)) { throw "Missing media generation template: $mediaTemplatePath" }
+$audit = Get-Content -LiteralPath $auditPath -Raw -Encoding UTF8 | ConvertFrom-Json
+
+$skillRootFull = [IO.Path]::GetFullPath($SkillRoot)
+$lines = [System.Collections.Generic.List[string]]::new()
+$lines.Add('# Generated by codex-starter-kit. Review and merge manually into ~/.codex/config.toml.')
+$lines.Add('# No credential values are stored in this fragment.')
+$lines.Add('# Default policy: core-ready, auto-installable-runtime, and unsupported Skills are enabled; guided-config Skills remain disabled until credentials/MCP are configured.')
+$lines.Add('')
+$allSkills = @($audit.skills | Sort-Object id)
+$allSkillIds = @($allSkills | ForEach-Object { [string]$_.id })
+$defaultEnabledStatuses = @('core-ready', 'auto-installable-runtime', 'unsupported')
+$defaultSkills = @($allSkills | Where-Object { [string]$_.afterRemediationStatus -in $defaultEnabledStatuses } | ForEach-Object { [string]$_.id })
+$requestedSkills = @($EnableSkills | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+$unknownSkills = @($requestedSkills | Where-Object { $_ -notin $allSkillIds })
+if ($unknownSkills.Count -gt 0) { throw "Cannot enable unknown Skill IDs: $($unknownSkills -join ', ')" }
+$enabledSkills = @($defaultSkills + $requestedSkills | Sort-Object -Unique)
+foreach ($skill in $allSkills) {
+    $skillFile = Join-Path (Join-Path $skillRootFull ([string]$skill.id)) 'SKILL.md'
+    $lines.Add('[[skills.config]]')
+    $lines.Add('path = ' + (ConvertTo-TomlString $skillFile))
+    $lines.Add('enabled = ' + $(if ($enabledSkills -contains [string]$skill.id) { 'true' } else { 'false' }))
+    $lines.Add('')
+}
+
+# These plugins ship in Codex's signed openai-bundled marketplace but are
+# optional-install entries. Enable all bundled plugins by default without
+# editing the signed MSIX. Existing plugin settings outside this managed block
+# are explicit user choices and win.
+$existingPluginConfigPath = Join-Path $TargetCodexHome 'config.toml'
+$existingPluginConfig = ''
+$script:existingManagedPluginConfig = ''
+if (Test-Path -LiteralPath $existingPluginConfigPath -PathType Leaf) {
+    $existingPluginConfig = [string](Get-Content -LiteralPath $existingPluginConfigPath -Raw -Encoding UTF8)
+    $managedPluginBlock = '(?ms)^# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1\r?\n.*?^# END CODEX-STARTER-KIT MANAGED CONFIG v1\r?\n?'
+    $existingManagedPluginMatch = [regex]::Match($existingPluginConfig, $managedPluginBlock)
+    if ($existingManagedPluginMatch.Success) {
+        $script:existingManagedPluginConfig = $existingManagedPluginMatch.Value
+    }
+    $existingPluginConfig = [regex]::Replace($existingPluginConfig, $managedPluginBlock, '')
+}
+$script:enabledBundledPlugins = [System.Collections.Generic.List[string]]::new()
+$script:preservedBundledPluginSettings = [System.Collections.Generic.List[string]]::new()
+Add-BundledPluginDefault 'codex-app-tools' @(
+    '[plugins."codex-app-tools@openai-bundled"]',
+    'enabled = true',
+    '',
+    '[plugins."codex-app-tools@openai-bundled".mcp_servers.codex_app]',
+    'enabled = true'
+) $existingPluginConfig
+Add-BundledPluginDefault 'browser' @(
+    '[plugins."browser@openai-bundled"]',
+    'enabled = true'
+) $existingPluginConfig
+Add-BundledPluginDefault 'unified-computer-use' @(
+    '[plugins."unified-computer-use@openai-bundled"]',
+    'enabled = true',
+    '',
+    '[plugins."unified-computer-use@openai-bundled".mcp_servers.cua_repl]',
+    'enabled = true'
+) $existingPluginConfig
+Add-BundledPluginDefault 'code-review' @(
+    '[plugins."code-review@openai-bundled"]',
+    'enabled = true',
+    '',
+    '[plugins."code-review@openai-bundled".mcp_servers.code-review]',
+    'enabled = true'
+) $existingPluginConfig
+foreach ($pluginId in @('chrome', 'computer-use', 'latex', 'deep-research', 'visualize', 'image-guided-assets')) {
+    Add-BundledPluginDefault $pluginId @(
+        ('[plugins."' + $pluginId + '@openai-bundled"]'),
+        'enabled = true'
+    ) $existingPluginConfig
+}
+
+if ($EnableFeishu) {
+    if (-not (Test-Path -LiteralPath $FeishuWrapperPath -PathType Leaf)) { throw "Feishu wrapper not found: $FeishuWrapperPath" }
+    $dryRunText = & $FeishuWrapperPath -PackageCache $FeishuPackageCache -Domain $FeishuDomain -AuthMode $FeishuAuthMode -DryRun | Out-String
+    $dryRunPlan = $dryRunText | ConvertFrom-Json
+    if (-not [bool]$dryRunPlan.packagePresent -or -not [bool]$dryRunPlan.packageValidated) {
+        throw "Locked Feishu package is absent or does not match the tool contract: $FeishuPackageCache"
+    }
+    if (-not [bool]$dryRunPlan.nodeReady) { throw 'Node.js >=20 is required before enabling Feishu.' }
+    $secretValue = [Environment]::GetEnvironmentVariable('FEISHU_APP_SECRET', 'Process')
+    if ($secretValue -and $dryRunText -match [regex]::Escape($secretValue)) { throw 'Feishu wrapper dry-run exposed App Secret.' }
+}
+
+$mediaTemplate = Get-Content -LiteralPath $mediaTemplatePath -Raw -Encoding UTF8
+if ($EnableMediaGeneration) {
+    if (-not (Test-Path -LiteralPath $MediaMcpWrapperPath -PathType Leaf)) { throw "Media MCP wrapper not found: $MediaMcpWrapperPath" }
+    $mediaHealthText = & $MediaMcpWrapperPath -HealthCheck | Out-String
+    if ($LASTEXITCODE -ne 0) { throw 'Bundled Python media MCP health check failed.' }
+    $mediaHealth = $mediaHealthText | ConvertFrom-Json
+    if (-not [bool]$mediaHealth.ready -or [string]$mediaHealth.serverVersion -ne '1.3.11' -or [string]$mediaHealth.healthScope -ne 'local-runtime-protocol' -or [string]$mediaHealth.runtimeStatus -ne 'passed' -or [string]$mediaHealth.protocolStatus -ne 'passed' -or [string]$mediaHealth.gatewayCatalogStatus -ne 'not_checked' -or [string]$mediaHealth.generationCapability -ne 'not_tested' -or [int]$mediaHealth.toolCount -ne 6) { throw 'Bundled Python media MCP local runtime/protocol check is unhealthy.' }
+}
+
+$mcpManifestPath = Join-Path $kitRoot 'manifest\mcp-servers.json'
+$mcpManifest = Get-Content -LiteralPath $mcpManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$remoteServers = @($mcpManifest.servers | Where-Object { [string]$_.transport -eq 'streamable-http' })
+$remoteIds = @($remoteServers | ForEach-Object { [string]$_.id })
+$requestedRemoteMcps = @($EnableRemoteMcps | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+$unknownRemoteMcps = @($requestedRemoteMcps | Where-Object { $_ -notin $remoteIds })
+if ($unknownRemoteMcps.Count -gt 0) { throw "Cannot enable unknown remote MCP IDs: $($unknownRemoteMcps -join ', ')" }
+foreach ($server in $remoteServers) {
+    $id = [string]$server.id
+    $url = [string]$server.url
+    if ($id -notmatch '^[a-zA-Z][a-zA-Z0-9_-]*$') { throw "Remote MCP id is invalid: $id" }
+    $uri = $null
+    if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https') {
+        throw "Remote MCP $id must declare a valid HTTPS url in the pack manifest."
+    }
+    $lines.Add("[mcp_servers.$id]")
+    $lines.Add('url = ' + (ConvertTo-TomlString $url))
+    $lines.Add('enabled = ' + $(if ($requestedRemoteMcps -contains $id) { 'true' } else { 'false' }))
+    $lines.Add('')
+}
+
+$template = Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8
+$feishuEnvironmentNames = @('FEISHU_APP_ID', 'FEISHU_APP_SECRET')
+if ($FeishuAuthMode -eq 'tenant') { $feishuEnvironmentNames += 'CODEX_USB_FEISHU_SETUP_ENTRY' }
+if ($FeishuAuthMode -eq 'user') { $feishuEnvironmentNames += 'FEISHU_USER_ACCESS_TOKEN' }
+$renderedEnvironmentNames = '[' + (($feishuEnvironmentNames | ForEach-Object { ConvertTo-TomlString $_ }) -join ', ') + ']'
+$replacements = @{
+    '__FEISHU_ENABLED__' = $(if ($EnableFeishu) { 'true' } else { 'false' })
+    '__FEISHU_WRAPPER__' = (ConvertTo-TomlString ([IO.Path]::GetFullPath($FeishuWrapperPath)))
+    '__FEISHU_MCP_CACHE__' = (ConvertTo-TomlString ([IO.Path]::GetFullPath($FeishuPackageCache)))
+    '__FEISHU_DOMAIN__' = (ConvertTo-TomlString $FeishuDomain.TrimEnd('/'))
+    '__FEISHU_AUTH_MODE__' = (ConvertTo-TomlString $FeishuAuthMode)
+    '__FEISHU_CONNECT_TOOL__' = $(if ($FeishuAuthMode -eq 'tenant') { '  "connect",' } else { '' })
+    '__FEISHU_ENV_VARS__' = $renderedEnvironmentNames
+}
+foreach ($key in $replacements.Keys) { $template = $template.Replace($key, [string]$replacements[$key]) }
+if ($template -match '__[A-Z0-9_]+__') { throw 'Rendered Feishu config still contains placeholders.' }
+$lines.Add($template.Trim())
+$mediaTemplate = $mediaTemplate.Replace('__MEDIA_GENERATION_ENABLED__', $(if ($EnableMediaGeneration) { 'true' } else { 'false' }))
+$mediaTemplate = $mediaTemplate.Replace('__MEDIA_GENERATION_WRAPPER__', (ConvertTo-TomlString ([IO.Path]::GetFullPath($MediaMcpWrapperPath))))
+if ($mediaTemplate -match '__[A-Z0-9_]+__') { throw 'Rendered media MCP config still contains placeholders.' }
+$lines.Add($mediaTemplate.Trim())
+$content = ($lines -join [Environment]::NewLine) + [Environment]::NewLine
+if ($content -match '(?i)(app[_-]?secret\s*=|FEISHU_APP_SECRET\s*=\s*["''][^"'']+)') {
+    throw 'Refusing to render a literal App Secret.'
+}
+
+$outputFull = [IO.Path]::GetFullPath($OutputPath)
+if ((Test-Path -LiteralPath $outputFull) -and -not $Overwrite) { throw "Output exists; use -Overwrite to replace it: $outputFull" }
+$outputParent = Split-Path -Parent $outputFull
+if (-not (Test-Path -LiteralPath $outputParent)) { New-Item -ItemType Directory -Force -Path $outputParent | Out-Null }
+$tempPath = $outputFull + '.tmp-' + [guid]::NewGuid().ToString('N')
+try {
+    Set-Content -LiteralPath $tempPath -Value $content -Encoding UTF8
+    $pythonPath = $PythonExe
+    if ([string]::IsNullOrWhiteSpace($pythonPath)) {
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        if ($python) { $pythonPath = $python.Source }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($pythonPath) -and (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+        & $pythonPath -c "import pathlib,sys,tomllib; tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8-sig'))" $tempPath
+        if ($LASTEXITCODE -ne 0) { throw 'Rendered TOML failed Python tomllib validation.' }
+    }
+    Move-Item -LiteralPath $tempPath -Destination $outputFull -Force
+} finally {
+    if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force }
+}
+
+[ordered]@{
+    output = $outputFull
+    totalSkills = $allSkills.Count
+    defaultEnabledSkills = @($defaultSkills)
+    disabledSkills = @($allSkills | Where-Object { $_.id -notin $enabledSkills } | ForEach-Object { [string]$_.id })
+    enabledSkills = @($enabledSkills)
+    enabledSkillCount = $enabledSkills.Count
+    disabledSkillCount = $allSkills.Count - $enabledSkills.Count
+    enabledBundledPlugins = @($script:enabledBundledPlugins)
+    preservedBundledPluginSettings = @($script:preservedBundledPluginSettings)
+    feishuEnabled = [bool]$EnableFeishu
+    mediaGenerationEnabled = [bool]$EnableMediaGeneration
+    enabledRemoteMcps = @($requestedRemoteMcps)
+    containsSecrets = $false
+} | ConvertTo-Json

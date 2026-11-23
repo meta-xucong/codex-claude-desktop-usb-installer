@@ -1,0 +1,2229 @@
+import { invoke } from "@tauri-apps/api/core";
+import { relaunch } from "@tauri-apps/plugin-process";
+
+import type {
+  AncillaryRetryReport,
+  AncillaryRetryRequest,
+  AppSettings,
+  CatalogSkin,
+  CodexThemeStatusReport,
+  StoreMigrationReport,
+  CodexThemeSummary,
+  CommandError,
+  CcswitchLaunchReport,
+  UsbHostStatus,
+  AccountStatus,
+  CcswitchUninstallReport,
+  CapabilityPackInstallOptions,
+  CapabilityPackReport,
+  SkillRepoApplyReport,
+  SkillRepoExpected,
+  SkillRepoRollbackReport,
+  SkillRepoSourceAttempt,
+  SkillRepoSourceAttemptPhase,
+  SkillRepoSourceAttemptResult,
+  SkillRepoSourceKind,
+  SkillRepoUpdateInfo,
+  CodexUpdatePlatform,
+  ConfigHealth,
+  ConfigWhich,
+  Diagnostics,
+  HistoricalInstallSelection,
+  HistoricalReleaseArchitecture,
+  HistoricalReleaseCatalog,
+  LocalReleasePackage,
+  MacInstallStatus,
+  MacPerformReport,
+  MacUninstallReport,
+  MacUpdateReport,
+  GatewayModelProbeReport,
+  GatewayModelProbeRequest,
+  LocalMediaModelSettings,
+  MediaModelCatalog,
+  NativeModelCatalogActionReport,
+  NativeModelCatalogActionRequest,
+  OfflinePayloadReport,
+  OfflineStageReport,
+  OperationKind,
+  OperationSnapshot,
+  OperationCompletion,
+  OperationToken,
+  WinInstallStatus,
+  WinPerformReport,
+  WinStageReport,
+  SkippedCodexUpdate,
+  WindowMode,
+  WindowModeReport,
+  WinUninstallReport,
+  WinBundleUninstallReport,
+  UninstallHandoffStatus,
+  WinUpdateReport,
+  UsbGuardStatus,
+  UsbInstallPreflightReport,
+} from "../shared/types";
+import { DEFAULT_SETTINGS, emptyOperationOutcome } from "../shared/types";
+
+const SETTINGS_LS = "cam.settings";
+export const SETTINGS_CHANGED_EVENT = "cam:settings-changed";
+const DEFAULT_PERIODIC_CHECK_INTERVAL_SECONDS = 15 * 60;
+const MIN_PERIODIC_CHECK_INTERVAL_SECONDS = 60;
+const MAX_PERIODIC_CHECK_INTERVAL_SECONDS = 7 * 24 * 60 * 60;
+const WINDOWS_UPDATE_PLAN_UI_TIMEOUT_MS = 150_000;
+const MAC_UPDATE_PLAN_UI_TIMEOUT_MS = 90_000;
+const MANAGER_UPDATE_CHECK_UI_TIMEOUT_MS = 35_000;
+const CODEX_PAYLOAD_CHECK_UI_TIMEOUT_MS = 180_000;
+const BROWSER_SKILL_REPO_ERROR = {
+  code: "unsupported_platform",
+  message: "Skill Hub update is unavailable in browser preview",
+} satisfies CommandError;
+
+function browserSkillRepoUnavailable(): Promise<never> {
+  return Promise.reject({ ...BROWSER_SKILL_REPO_ERROR });
+}
+
+/**
+ * A broken native bridge must not leave an update screen in its checking state
+ * forever. This watchdog only stops waiting in the renderer; native commands
+ * keep their own bounded network/process timeouts and may finish in the
+ * background. The generation guards in the calling views ignore late results.
+ */
+function withUpdateCheckWatchdog<T>(
+  request: Promise<T>,
+  timeoutMs: number,
+  checkName: string,
+): Promise<T> {
+  let timer: number | undefined;
+  const watchdog = new Promise<never>((_resolve, reject) => {
+    timer = window.setTimeout(() => {
+      reject({
+        code: "timeout",
+        message: `${checkName} UI watchdog expired`,
+        detail: `stage=ui-check-watchdog; timeout_ms=${timeoutMs}`,
+      } satisfies CommandError);
+    }, timeoutMs);
+  });
+  return Promise.race([request, watchdog]).finally(() => {
+    if (timer !== undefined) window.clearTimeout(timer);
+  });
+}
+
+export type ManagerUpdateCheck =
+  | { kind: "development" }
+  | { kind: "unavailable" }
+  | { kind: "none" }
+  | ManagerUpdateAvailable;
+
+export interface ManagerUpdateAvailable {
+  kind: "available";
+  version: string;
+  currentVersion: string;
+  body?: string;
+  installAndRelaunch: () => Promise<void>;
+  discard: () => Promise<void>;
+}
+
+interface ManagerUpdateMetadata {
+  version: string;
+  currentVersion: string;
+  body?: string;
+}
+
+/** Channel-identifying subset of the backend `UpdateInfo` (kebab tag). */
+export type CodexChannel = "manager" | "codex" | "ccswitch" | "skill-repo";
+
+export interface UpdateInfo {
+  channel: CodexChannel;
+  currentVersion: string;
+  latestVersion: string;
+  releaseNotes?: string | null;
+  sizeBytes?: number | null;
+  requiresRestart: boolean;
+  payload: unknown;
+}
+
+export type CodexPayloadCheck =
+  | { kind: "development" }
+  | { kind: "unavailable"; message: string }
+  | { kind: "none" }
+  | { kind: "available"; info: UpdateInfo };
+
+let lastCodexPayloadError: string | null = null;
+
+export interface FrontendErrorPayload {
+  kind: string;
+  message: string;
+  stack: string | null;
+  componentStack: string | null;
+}
+
+function normalizedInterval(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_PERIODIC_CHECK_INTERVAL_SECONDS;
+  return Math.max(
+    MIN_PERIODIC_CHECK_INTERVAL_SECONDS,
+    Math.min(MAX_PERIODIC_CHECK_INTERVAL_SECONDS, Math.floor(n)),
+  );
+}
+
+function normalizedProxyMode(value: unknown): AppSettings["proxyMode"] {
+  return value === "direct" || value === "custom" || value === "system"
+    ? value
+    : "system";
+}
+
+function normalizedCodexPayloadSourceKind(
+  value: unknown,
+): AppSettings["codexPayloadSourceKind"] {
+  if (value === "mirror") return "auto";
+  return value === "relay" || value === "github" || value === "auto"
+    ? value
+    : "auto";
+}
+
+function normalizedSkippedCodexUpdate(
+  value: unknown,
+): SkippedCodexUpdate | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Partial<Record<keyof SkippedCodexUpdate, unknown>>;
+  const platform = raw.platform;
+  const target = typeof raw.target === "string" ? raw.target.trim() : "";
+  const version = typeof raw.version === "string" ? raw.version.trim() : "";
+  const skippedAt = Number(raw.skippedAt);
+  const validPlatform = platform === "macos" || platform === "windows";
+  if (!validPlatform || !target || !version || !Number.isFinite(skippedAt)) {
+    return null;
+  }
+  return {
+    platform: platform as CodexUpdatePlatform,
+    target,
+    version,
+    skippedAt: Math.max(0, Math.floor(skippedAt)),
+  };
+}
+
+function normalizeSettings(raw: Partial<AppSettings>): AppSettings {
+  const legacyAuto =
+    typeof raw.autoCheck === "boolean"
+      ? raw.autoCheck
+      : DEFAULT_SETTINGS.autoCheck;
+  const periodic =
+    typeof raw.periodicCheck === "boolean" ? raw.periodicCheck : legacyAuto;
+  const customUrl =
+    typeof raw.customUrl === "string" ? raw.customUrl.trim() : "";
+  const customProxyUrl =
+    typeof raw.customProxyUrl === "string" ? raw.customProxyUrl.trim() : "";
+  const codexPayloadBaseUrl =
+    typeof raw.codexPayloadBaseUrl === "string"
+      ? raw.codexPayloadBaseUrl.trim()
+      : "";
+  // Empty custom modes are not a real runtime choice — fall back so UI, disk,
+  // and update paths agree (mirror/auto for source, system proxy for network).
+  let source = raw.source ?? DEFAULT_SETTINGS.source;
+  if (source === "custom" && !customUrl) {
+    source = "auto";
+  }
+  let proxyMode = normalizedProxyMode(raw.proxyMode);
+  if (proxyMode === "custom" && !customProxyUrl) {
+    proxyMode = "system";
+  }
+  return {
+    ...DEFAULT_SETTINGS,
+    ...raw,
+    source,
+    customUrl,
+    autoCheck: periodic,
+    checkOnStartup:
+      typeof raw.checkOnStartup === "boolean" ? raw.checkOnStartup : legacyAuto,
+    periodicCheck: periodic,
+    periodicCheckIntervalSeconds: normalizedInterval(
+      raw.periodicCheckIntervalSeconds,
+    ),
+    signedOnly: true,
+    proxyMode,
+    customProxyUrl,
+    codexPayloadSourceKind: normalizedCodexPayloadSourceKind(
+      raw.codexPayloadSourceKind,
+    ),
+    codexPayloadBaseUrl:
+      codexPayloadBaseUrl || DEFAULT_SETTINGS.codexPayloadBaseUrl,
+    disableCodexSelfUpdates:
+      typeof raw.disableCodexSelfUpdates === "boolean"
+        ? raw.disableCodexSelfUpdates
+        : DEFAULT_SETTINGS.disableCodexSelfUpdates,
+    skippedCodexUpdate: normalizedSkippedCodexUpdate(raw.skippedCodexUpdate),
+    codexTheme:
+      typeof raw.codexTheme === "string" && raw.codexTheme.trim()
+        ? raw.codexTheme
+        : null,
+    codexThemeDir:
+      typeof raw.codexThemeDir === "string" && raw.codexThemeDir.trim()
+        ? raw.codexThemeDir
+        : null,
+    codexThemeStoreDir:
+      typeof raw.codexThemeStoreDir === "string" &&
+      raw.codexThemeStoreDir.trim()
+        ? raw.codexThemeStoreDir
+        : null,
+    codexPayloadRepo:
+      typeof raw.codexPayloadRepo === "string"
+        ? raw.codexPayloadRepo.trim()
+        : "",
+  };
+}
+
+function emitSettingsChanged(settings: AppSettings) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent<AppSettings>(SETTINGS_CHANGED_EVENT, { detail: settings }),
+  );
+}
+
+function localSettings(): AppSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_LS);
+    if (raw) return normalizeSettings(JSON.parse(raw));
+  } catch {
+    // ignore
+  }
+  return { ...DEFAULT_SETTINGS };
+}
+
+declare global {
+  interface Window {
+    __TAURI_INTERNALS__?: unknown;
+  }
+}
+
+function hasTauriRuntime(): boolean {
+  return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
+}
+
+// A failing Tauri command rejects with the serialized backend `CommandError`
+// ({ code, message }). Narrow defensively — `cause` may also be a JS `Error`,
+// a plain string, or some other thrown value — and surface the most useful text.
+function isCommandError(cause: unknown): cause is CommandError {
+  if (!cause || typeof cause !== "object") {
+    return false;
+  }
+  const maybe = cause as Partial<Record<keyof CommandError, unknown>>;
+  return typeof maybe.message === "string" || typeof maybe.code === "string";
+}
+
+const SKILL_REPO_SOURCE_IDS = new Set([
+  "cn-mirror-1",
+  "cn-mirror-2",
+  "cn-mirror-3",
+  "ph-relay",
+  "github",
+]);
+const SKILL_REPO_SOURCE_KINDS = new Set<SkillRepoSourceKind>([
+  "domestic",
+  "relay",
+  "github",
+]);
+const SKILL_REPO_ATTEMPT_PHASES = new Set<SkillRepoSourceAttemptPhase>([
+  "metadata",
+  "archive",
+  "verify",
+]);
+const SKILL_REPO_ATTEMPT_RESULTS = new Set<SkillRepoSourceAttemptResult>([
+  "ok",
+  "timeout",
+  "unavailable",
+  "http",
+  "invalid",
+  "hash-mismatch",
+  "cancelled",
+]);
+
+function isSkillRepoRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object";
+}
+
+function safeSkillRepoAttempt(value: unknown): SkillRepoSourceAttempt | null {
+  if (!isSkillRepoRecord(value)) return null;
+  const sourceId = value.sourceId;
+  const sourceKind = value.sourceKind;
+  const phase = value.phase;
+  const result = value.result;
+  const httpStatus = value.httpStatus;
+  const elapsedMs = value.elapsedMs;
+  if (
+    typeof sourceId !== "string" ||
+    !SKILL_REPO_SOURCE_IDS.has(sourceId) ||
+    typeof sourceKind !== "string" ||
+    !SKILL_REPO_SOURCE_KINDS.has(sourceKind as SkillRepoSourceKind) ||
+    typeof phase !== "string" ||
+    !SKILL_REPO_ATTEMPT_PHASES.has(phase as SkillRepoSourceAttemptPhase) ||
+    typeof result !== "string" ||
+    !SKILL_REPO_ATTEMPT_RESULTS.has(result as SkillRepoSourceAttemptResult) ||
+    typeof elapsedMs !== "number" ||
+    !Number.isFinite(elapsedMs) ||
+    elapsedMs < 0
+  ) {
+    return null;
+  }
+  return {
+    sourceId,
+    sourceKind: sourceKind as SkillRepoSourceKind,
+    phase: phase as SkillRepoSourceAttemptPhase,
+    result: result as SkillRepoSourceAttemptResult,
+    httpStatus:
+      typeof httpStatus === "number" &&
+      Number.isInteger(httpStatus) &&
+      httpStatus >= 100 &&
+      httpStatus <= 599
+        ? httpStatus
+        : null,
+    elapsedMs: Math.round(elapsedMs),
+  };
+}
+
+/** Keep only the fixed, non-sensitive Skill Hub attempt fields from IPC data. */
+export function sanitizeSkillRepoAttempts(value: unknown): SkillRepoSourceAttempt[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((attempt) => {
+    const safe = safeSkillRepoAttempt(attempt);
+    return safe ? [safe] : [];
+  });
+}
+
+/** Read and sanitize a structured Skill Hub attempt chain from a command error. */
+export function skillRepoAttempts(cause: unknown): SkillRepoSourceAttempt[] {
+  if (!isSkillRepoRecord(cause)) return [];
+  if (Array.isArray(cause.attempts)) {
+    return sanitizeSkillRepoAttempts(cause.attempts);
+  }
+  if (typeof cause.detail === "string") {
+    try {
+      const detail = JSON.parse(cause.detail) as unknown;
+      if (isSkillRepoRecord(detail) && Array.isArray(detail.attempts)) {
+        return sanitizeSkillRepoAttempts(detail.attempts);
+      }
+    } catch {
+      // Detail is still handled by the normal redacted error disclosure.
+    }
+  }
+  return [];
+}
+
+export function errorMessage(cause: unknown): string {
+  if (cause instanceof Error) {
+    return cause.message;
+  }
+  if (typeof cause === "string") {
+    return cause;
+  }
+  if (isCommandError(cause)) {
+    if (typeof cause.message === "string" && cause.message.trim()) {
+      return cause.message;
+    }
+    if (typeof cause.code === "string" && cause.code.trim()) {
+      return cause.code;
+    }
+    try {
+      return JSON.stringify(cause);
+    } catch {
+      // fall through
+    }
+  }
+  return String(cause);
+}
+
+/** Optional backend detail kept separate from the primary localized message. */
+export function errorDetail(cause: unknown): string | null {
+  if (!isCommandError(cause)) return null;
+  return typeof cause.detail === "string" && cause.detail.trim() ? cause.detail : null;
+}
+
+/** Stable machine code from a backend `CommandError`, or null for other throwables. */
+export function errorCode(cause: unknown): string | null {
+  if (
+    isCommandError(cause) &&
+    typeof cause.code === "string" &&
+    cause.code.trim()
+  ) {
+    return cause.code;
+  }
+  return null;
+}
+
+export function isDownloadCancelled(cause: unknown): boolean {
+  return errorMessage(cause).toLowerCase().includes("download cancelled");
+}
+
+// Connectivity failures (DNS / TLS / timeout / curl transport) all surface here
+// as opaque engine strings. Match transport-specific text, not the generic
+// "curl failed for ..." wrapper: curl exit 22 also uses that wrapper for HTTP
+// 404/500 responses, where the right guidance is "try later / switch source"
+// rather than "check your connection".
+const NETWORK_ERROR_MARKERS = [
+  "could not resolve host",
+  "connection timed out",
+  "operation timed out",
+  "failed to connect",
+  "connection reset",
+  "connection refused",
+  "network is unreachable",
+  "empty reply from server",
+  "appcast are unreachable",
+  "curl: (6)",
+  "curl: (7)",
+  "curl: (28)",
+  "curl: (35)",
+  "curl: (52)",
+  "curl: (56)",
+  "ssl/tls",
+  "schannel",
+];
+
+/** Heuristic: does this surfaced error message describe a connectivity failure
+ *  rather than a logic/verification error? Lets the UI show a calm "can't reach
+ *  the update server, retry" instead of a raw curl diagnostic. */
+export function isNetworkError(message: string): boolean {
+  const m = message.toLowerCase();
+  return NETWORK_ERROR_MARKERS.some((marker) => m.includes(marker));
+}
+
+// Browser-dev fallbacks (no Tauri runtime) so the UI renders meaningfully
+// outside the desktop shell. macOS simulates an update; Windows simulates the
+// up-to-date metadata view.
+const FALLBACK_PLAN: MacUpdateReport = {
+  appcastUrl: "https://persistent.oaistatic.com/codex-app-prod/appcast.xml",
+  installed: null,
+  simulatedBuild: 3511,
+  latestPubDate: "Fri, 26 Jun 2026 10:10:00 GMT",
+  plan: {
+    upToDate: false,
+    currentBuild: 3511,
+    latestBuild: 3575,
+    latestShortVersion: "26.602.30954",
+    strategy: { kind: "delta", fromBuild: 3511 },
+    downloadUrl:
+      "https://persistent.oaistatic.com/codex-app-prod/Codex3575-3511-arm64.delta",
+    downloadSize: 18260894,
+    edSignature: "(browser-dev mock)",
+    fullSize: 406581087,
+    savingsPct: 95.5,
+  },
+};
+
+const WIN_FALLBACK_INSTALLED = {
+  path: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.623.5546.0_x64__2p2nqsd0c76g0",
+  version: "26.623.42026",
+  arch: "x64",
+  source: "msix",
+  packageFamilyName: "OpenAI.Codex_2p2nqsd0c76g0",
+  installedAt: 1_782_489_000,
+};
+
+const WIN_FALLBACK_PLAN: WinUpdateReport = {
+  manifestUrl: "https://codexapp.agentsmirror.com/latest/manifest",
+  checksumsUrl: "https://codexapp.agentsmirror.com/latest/checksums",
+  packageUrl: "https://codexapp.agentsmirror.com/latest/win",
+  release: {
+    version: "26.623.42026",
+    packageVersion: "26.623.5546.0",
+    releasedAt: "Sat, 27 Jun 2026 05:28:48 GMT",
+    packageMoniker: "OpenAI.Codex_26.623.5546.0_x64__2p2nqsd0c76g0",
+    architecture: "x64",
+    contentLength: 671037642,
+    etag: '"4XJflSyTxVc59Sr2FfA4HAqFCD0="',
+    storeProductId: "9PLM9XGG6VKS",
+    packageIdentity: "OpenAI.Codex",
+  },
+  installed: WIN_FALLBACK_INSTALLED,
+  capabilities: {
+    addAppxPackage: { state: "available", detail: "browser-dev mock" },
+    appxService: { state: "available", detail: "browser-dev mock" },
+    sideloadPolicy: { state: "unknown", detail: "browser-dev mock" },
+    appInstaller: { state: "available", detail: "browser-dev mock" },
+    msixDeployment: { state: "available", detail: "browser-dev mock" },
+    meteredNetwork: { state: "unknown", detail: "browser-dev mock" },
+    recommendation: "msix-preferred",
+    notes: ["Certificate trust is verified after the MSIX is staged."],
+  },
+  plan: {
+    upToDate: true,
+    currentVersion: "26.623.42026",
+    latestVersion: "26.623.42026",
+    packageMoniker: "OpenAI.Codex_26.623.5546.0_x64__2p2nqsd0c76g0",
+    packageUrl: "https://codexapp.agentsmirror.com/latest/win",
+    downloadSize: 671037642,
+    sha256: "6dc2e05ac2b760bbc77ce3f8a992efdb327363512c9c4744b9a146c41bc4d55a",
+    route: "msix-sideload",
+    portableFallbackReady: true,
+    warnings: [],
+  },
+};
+
+const WIN_FALLBACK_STAGE: WinStageReport = {
+  upToDate: false,
+  route: "msix-sideload",
+  latestVersion: "26.602.3474.0",
+  packageMoniker: "OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0",
+  downloadSize: 566504666,
+  stagedPath:
+    "(browser-dev mock) …/OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0.msix",
+  sha256: "6dc2e05ac2b760bbc77ce3f8a992efdb327363512c9c4744b9a146c41bc4d55a",
+  hashVerified: true,
+  authenticode: {
+    trusted: true,
+    publisherIsOpenai: true,
+    status: "Valid",
+    statusMessage: "browser-dev mock",
+    subject: "CN=OpenAI OpCo, LLC",
+    issuer: "browser-dev mock",
+    thumbprint: "browser-dev mock",
+  },
+  identity: {
+    name: "OpenAI.Codex",
+    publisher: "CN=OpenAI OpCo, LLC",
+    version: "26.602.3474.0",
+    processorArchitecture: "x64",
+  },
+  identityVerified: true,
+  installReady: true,
+  portableFallbackReady: true,
+  notes: [
+    "Non-destructive staging only; install execution is the next guarded step.",
+  ],
+};
+
+const OFFLINE_FALLBACK_REPORT: OfflinePayloadReport = {
+  ready: true,
+  manifestPath: "C:\\CodexUSB\\manifest.json",
+  payloadPath: "C:\\CodexUSB\\payload\\OpenAI.Codex_x64.msix",
+  fileName: "OpenAI.Codex_x64.msix",
+  size: 566504666,
+  sha256: "6dc2e05ac2b760bbc77ce3f8a992efdb327363512c9c4744b9a146c41bc4d55a",
+  hashVerified: true,
+  packageName: "OpenAI.Codex",
+  packageVersion: "26.602.3474.0",
+  codexDesktopVersion: "26.602.3474",
+  architecture: "x64",
+  minWindowsBuild: "19041",
+  appEntry: "app\\Codex.exe",
+  appVersionVerified: true,
+  releaseTag: "local-signed-26.602.3474",
+  authenticode: null,
+  warning: "浏览器预览使用模拟载荷；桌面版会执行真实签名校验。",
+};
+
+const WIN_FALLBACK_PERFORM: WinPerformReport = {
+  success: true,
+  action: "msix-sideload",
+  message: "browser-dev mock: Add-AppxPackage succeeded",
+  stage: WIN_FALLBACK_STAGE,
+  sideload: {
+    success: true,
+    message: "browser-dev mock: Add-AppxPackage succeeded",
+    installed: {
+      path: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0",
+      version: "26.602.3474.0",
+      arch: "x64",
+      source: "msix",
+      packageFamilyName: "OpenAI.Codex_2p2nqsd0c76g0",
+    },
+    fallbackRecommended: false,
+    rawError: null,
+  },
+  portable: null,
+  msixHealth: {
+    healthy: true,
+    verified: true,
+    packageRegistered: true,
+    status: "Ok",
+    statusOk: true,
+    aumidResolved: true,
+    missingDependencies: [],
+    activationOk: true,
+    failureKind: "",
+    reason: "",
+  },
+  installed: {
+    path: "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.602.3474.0_x64__2p2nqsd0c76g0",
+    version: "26.602.3474.0",
+    arch: "x64",
+    source: "msix",
+    packageFamilyName: "OpenAI.Codex_2p2nqsd0c76g0",
+  },
+  fallbackAvailable: true,
+  fallbackAttempted: false,
+  notes: ["browser-dev mock: install path is simulated."],
+  outcome: emptyOperationOutcome({
+    primaryOk: true,
+    appState: "present",
+    installClass: "managed",
+  }),
+};
+
+const WIN_FALLBACK_UNINSTALL: WinUninstallReport = {
+  success: true,
+  action: "remove-portable",
+  message: "browser-dev mock: uninstall completed",
+  installedBefore: WIN_FALLBACK_PERFORM.installed,
+  msix: null,
+  portable: {
+    success: true,
+    partial: false,
+    installRoot: "%LOCALAPPDATA%\\Programs\\Codex",
+    removedFiles: true,
+    removedShortcut: true,
+    removedUninstallEntry: true,
+    purgedUserData: false,
+    message: "browser-dev mock: portable uninstall completed",
+    notes: ["browser-dev mock"],
+  },
+  purgedUserData: false,
+  notes: ["User data was preserved."],
+  outcome: emptyOperationOutcome({
+    primaryOk: true,
+    appState: "absent",
+    installClass: "none",
+  }),
+};
+
+const CCSWITCH_FALLBACK_UNINSTALL: CcswitchUninstallReport = {
+  success: true,
+  installedBefore: true,
+  removedInstall: true,
+  removedAutostart: false,
+  purgedUserData: false,
+  installDir: "%LOCALAPPDATA%\\Programs\\CodexSwitch",
+  dataDirs: ["%USERPROFILE%\\.cc-switch"],
+  message: "browser-dev mock: CCSwitch uninstall completed",
+  notes: ["browser-dev mock"],
+};
+
+const WIN_FALLBACK_BUNDLE_UNINSTALL: WinBundleUninstallReport = {
+  success: true,
+  codex: WIN_FALLBACK_UNINSTALL,
+  codexError: null,
+  ccswitch: CCSWITCH_FALLBACK_UNINSTALL,
+  ccswitchError: null,
+  message: "browser-dev mock: Codex and CCSwitch uninstall completed",
+  notes: ["browser-dev mock"],
+  purgedUserData: false,
+  purgedCcswitchData: false,
+  outcome: emptyOperationOutcome({
+    primaryOk: true,
+    appState: "absent",
+    installClass: "none",
+  }),
+};
+
+const FALLBACK_CONFIG_HEALTH: ConfigHealth = {
+  settingsStatus: "ok",
+  provenanceStatus: "ok",
+  unknownSource: null,
+  detail: null,
+  settingsBackupAvailable: false,
+  provenanceBackupAvailable: false,
+};
+
+const FALLBACK_DIAGNOSTICS: Diagnostics = {
+  appVersion: "0.0.0",
+  os: "browser",
+  arch: "unknown",
+  locale: null,
+  updateSource: "auto",
+  customSourceHost: null,
+  windowsInstallMode: null,
+  installStatus: "browser preview",
+  configHealth: { ...FALLBACK_CONFIG_HEALTH },
+  logsDir: null,
+  recentErrors: [],
+  logTail: "",
+  generatedAtUnix: Math.floor(Date.now() / 1000),
+};
+
+// Browser-preview stand-ins so the theme gallery can be developed and styled
+// without a Tauri backend (mirrors guts-terminal / asuka-eva02 palettes).
+const FALLBACK_THEME_META: import("../shared/types").CodexThemeMeta = {
+  version: "1.0.0",
+  author: "wangnov",
+  codexVerified: "26.707.91948",
+  appearance: "dual",
+  tags: [],
+  license: "personal-use",
+  previews: [],
+};
+
+// Browser-preview mock corpus (dev only — never reached under Tauri, which
+// always calls the backend). Enough varied items to exercise pagination, list
+// view, selection and batch delete during layout work.
+const MOCK_PALETTES = [
+  {
+    base: "#1a1d24",
+    panel: "#232833",
+    accent: "#d97e2a",
+    ink: "#f2e9d8",
+    line: "#3a4150",
+  },
+  {
+    base: "#17131a",
+    panel: "#241c26",
+    accent: "#ff6a00",
+    ink: "#f5ede4",
+    line: "#453343",
+  },
+  {
+    base: "#0f1420",
+    panel: "#18203a",
+    accent: "#3f7bd6",
+    ink: "#e6eefb",
+    line: "#26324f",
+  },
+  {
+    base: "#1c1008",
+    panel: "#2a180d",
+    accent: "#e8a33d",
+    ink: "#f7e8c2",
+    line: "#4a2f16",
+  },
+  {
+    base: "#120f16",
+    panel: "#1e1826",
+    accent: "#a86ee0",
+    ink: "#efe7fb",
+    line: "#332a44",
+  },
+  {
+    base: "#0d1712",
+    panel: "#152720",
+    accent: "#46c077",
+    ink: "#e2f5ea",
+    line: "#20402f",
+  },
+];
+const MOCK_SKINS = [
+  [
+    "asuka-eva02",
+    "NERV EVA-02 Asuka Terminal",
+    "碇真嗣与 EVA 初号机：以 CAGE-01 拘束机库、同步诊断和紫绿装甲构成的 NERV 素材化主题。",
+  ],
+  [
+    "caishen-jubao",
+    "财神聚宝阁 · Fortune Pavilion",
+    "金框红底玉字与元宝铜钱的招财主题。",
+  ],
+  [
+    "three-kingdoms",
+    "赤壁风云 · Three Kingdoms",
+    "原创三国演义主题：关羽、青龙偃月刀、赤壁火光、军阵沙盘与三方旌旗构成雄浑而富戏剧性的 Codex 皮肤。",
+  ],
+  [
+    "shinji-eva01",
+    "NERV EVA-01 Shinji Synchronization Terminal",
+    "碇真嗣与 EVA 初号机：以 CAGE-01 拘束机库、同步诊断和紫绿装甲构成的 NERV 素材化主题。",
+  ],
+  ["dilraba-starlight", "迪丽热巴 · STARLIGHT 星蝶光廊", ""],
+  [
+    "luffy-onepiece",
+    "Thousand Sunny — Dawn Adventure",
+    "草帽一伙的黎明冒险配色。",
+  ],
+  ["kakashi-naruto", "Konoha ANBU — Lightning Copy Ninja", ""],
+  [
+    "jensen-infinite-compute",
+    "Jensen Infinite Compute",
+    "皮革夹克与无尽算力的绿色矩阵。",
+  ],
+  ["mai-shiranui", "Shiranui Dojo — Scarlet Flame", "不知火舞的绯红烈焰道场。"],
+  ["ming-imperial", "大明宫阙 · Ming Imperial", ""],
+  [
+    "kaworu-mark06",
+    "SEELE Mark.06 Kaworu Terminal",
+    "渚薰与 Mark.06 的月白终端。",
+  ],
+  ["jay-chou-inkstone", "周杰伦 · 墨键夜航", "水墨与钢琴键的夜航。"],
+  ["luo-feng-domain", "银河领主 — 罗峰·陨墨星域", "吞噬星空罗峰的星域主题。"],
+  ["rem-rezero", "Rem — Oni Maid Devotion", ""],
+  ["western-pure-land", "西方极乐 · Pure Land", "金莲与祥云的极乐净土。"],
+  ["trump-golden-order", "Golden Order", "描金秩序主题。"],
+];
+function mockTheme(index: number, origin: "dev" | "store"): CodexThemeSummary {
+  const [id, name, description] = MOCK_SKINS[index % MOCK_SKINS.length];
+  const p = MOCK_PALETTES[index % MOCK_PALETTES.length];
+  return {
+    id,
+    name,
+    description,
+    dir: `/dev/themes/${id}`,
+    hasNativeTheme: true,
+    colors: { ...p },
+    preview: null,
+    meta: { ...FALLBACK_THEME_META, version: `1.${index % 3}.0` },
+    origin,
+  };
+}
+const BROWSER_FALLBACK_THEMES: CodexThemeSummary[] = MOCK_SKINS.map((_, i) =>
+  mockTheme(i, i % 5 === 0 ? "dev" : "store"),
+);
+const MOCK_CATEGORIES = ["anime", "stars", "tech", "guofeng", "games"];
+const MOCK_TAG_SETS = [
+  ["dark", "terminal"],
+  ["light", "minimal"],
+  ["dark", "vibrant"],
+];
+const BROWSER_FALLBACK_CATALOG: CatalogSkin[] = MOCK_SKINS.map(
+  ([id, name, description], i) => ({
+    id,
+    name,
+    description,
+    version: "1.2.0",
+    author: "Wangnov",
+    appearance: "dual",
+    license: "personal-use",
+    tags: MOCK_TAG_SETS[i % MOCK_TAG_SETS.length],
+    codexVerified: "26.715.21425",
+    bytes: 3_000_000 + i * 100_000,
+    sha256: "0".repeat(64),
+    pack: `packs/${id}-1.2.0.codexskin`,
+    preview: `previews/${id}.webp`,
+    category: MOCK_CATEGORIES[i % MOCK_CATEGORIES.length],
+  }),
+);
+
+const BROWSER_FALLBACK_THEME_STATUS: CodexThemeStatusReport = {
+  supported: true,
+  activeTheme: null,
+  daemon: null,
+  cdpReady: false,
+  codexRunning: false,
+  nativeBackupPresent: false,
+  storeDir: null,
+  tryOnStash: false,
+  recoveryRequired: false,
+};
+
+// ── Contract guards ──────────────────────────────────────────────────────────
+// invoke<T>() is a bare type assertion: if the backend contract drifts (field
+// renamed, made nullable), the UI would otherwise crash deep in a render with
+// an unhelpful stack. Guard the load-bearing read paths — the report/status
+// shapes every home-screen decision keys on — and fail them as a readable
+// CommandError instead. Only structural keystones are checked, not every
+// field: enough to catch a desynced engine, cheap enough to never drift far
+// from the real types.
+
+function contractError(what: string): CommandError {
+  return {
+    code: "contract_mismatch",
+    message: `Backend returned an unexpected ${what} shape — the app and its engine may be out of sync. Reinstalling the manager usually fixes this.`,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object";
+}
+
+function guardMacStatus(status: MacInstallStatus): MacInstallStatus {
+  const s = status as unknown;
+  if (
+    !isRecord(s) ||
+    typeof s.status !== "string" ||
+    (s.installed !== null &&
+      !(isRecord(s.installed) && typeof s.installed.build === "number"))
+  ) {
+    throw contractError("macOS install status");
+  }
+  return status;
+}
+
+function guardMacReport(report: MacUpdateReport): MacUpdateReport {
+  const r = report as unknown;
+  if (
+    !isRecord(r) ||
+    (r.installed !== null &&
+      !(isRecord(r.installed) && typeof r.installed.build === "number")) ||
+    (r.plan !== null &&
+      !(isRecord(r.plan) && typeof r.plan.upToDate === "boolean"))
+  ) {
+    throw contractError("macOS update report");
+  }
+  return report;
+}
+
+function guardWinStatus(status: WinInstallStatus): WinInstallStatus {
+  const s = status as unknown;
+  if (
+    !isRecord(s) ||
+    typeof s.status !== "string" ||
+    (s.installed !== null &&
+      !(isRecord(s.installed) && typeof s.installed.version === "string"))
+  ) {
+    throw contractError("Windows install status");
+  }
+  return status;
+}
+
+function guardWinReport(report: WinUpdateReport): WinUpdateReport {
+  const r = report as unknown;
+  if (
+    !isRecord(r) ||
+    !(isRecord(r.plan) && typeof r.plan.upToDate === "boolean") ||
+    (r.installed !== null &&
+      !(isRecord(r.installed) && typeof r.installed.version === "string"))
+  ) {
+    throw contractError("Windows update report");
+  }
+  return report;
+}
+
+export const managerApi = {
+  beginTrackedOperation(kind: OperationKind): Promise<OperationToken> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(`browser-dev-token-${kind}`);
+    }
+    return invoke<OperationToken>("begin_operation", { kind });
+  },
+  armDestructive(kind: OperationKind): Promise<OperationToken> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(`browser-dev-token-${kind}`);
+    }
+    return invoke<OperationToken>("arm_destructive", { kind });
+  },
+  /** Active install/update lease, or null when idle. Queried on mount to reattach. */
+  getOperationSnapshot(): Promise<OperationSnapshot | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<OperationSnapshot | null>("get_operation_snapshot");
+  },
+  /** Resumable pause retained after its active lease has already ended. */
+  getPausedOperationSnapshot(): Promise<OperationSnapshot | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<OperationSnapshot | null>("get_paused_operation_snapshot");
+  },
+  /** Token-keyed terminal evidence retained after a renderer loses its invoke. */
+  getOperationCompletion(
+    token: OperationToken,
+  ): Promise<OperationCompletion | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<OperationCompletion | null>("get_operation_completion", {
+      token,
+    });
+  },
+  historicalReleaseCatalog(
+    platform: "macos" | "windows",
+    architecture: HistoricalReleaseArchitecture,
+  ): Promise<HistoricalReleaseCatalog> {
+    if (!hasTauriRuntime()) {
+      const version = "26.727.51351";
+      const packageVersion = "26.727.6591.0";
+      return Promise.resolve({
+        repository: "Wangnov/codex-app-mirror",
+        platform,
+        architecture,
+        releases: [
+          {
+            tag: `codex-app-${version}`,
+            version,
+            publishedAt: "2026-08-01T00:17:13Z",
+            assets:
+              platform === "macos"
+                ? [
+                    {
+                      name: `Codex-mac-${architecture}.dmg`,
+                      size: 560_000_000,
+                      architecture,
+                      format: "dmg" as const,
+                      packageVersion: null,
+                    },
+                    {
+                      name: `Codex-darwin-${architecture}-${version}.zip`,
+                      size: 530_000_000,
+                      architecture,
+                      format: "zip" as const,
+                      packageVersion: null,
+                    },
+                  ]
+                : [
+                    {
+                      name: `OpenAI.Codex_${packageVersion}_${architecture}__2p2nqsd0c76g0.Msix`,
+                      size: 755_000_000,
+                      architecture,
+                      format: "msix" as const,
+                      packageVersion,
+                    },
+                  ],
+          },
+        ],
+      });
+    }
+    return invoke<HistoricalReleaseCatalog>("historical_release_catalog", {
+      architecture,
+    });
+  },
+  historicalPickLocalPackage(
+    platform: "macos" | "windows",
+    architecture: HistoricalReleaseArchitecture,
+  ): Promise<LocalReleasePackage | null> {
+    if (!hasTauriRuntime()) {
+      const version = "26.727.51351";
+      const packageVersion = platform === "windows" ? "26.727.6591.0" : null;
+      const assetName =
+        platform === "macos"
+          ? `Codex-mac-${architecture}.dmg`
+          : `OpenAI.Codex_${packageVersion}_${architecture}__2p2nqsd0c76g0.Msix`;
+      return Promise.resolve({
+        path: `/Users/example/Downloads/${assetName}`,
+        fileName: assetName,
+        size: platform === "macos" ? 560_000_000 : 755_000_000,
+        releaseTag: `local-signed-${version}`,
+        version,
+        assetName,
+        architecture,
+        format: platform === "macos" ? "dmg" : "msix",
+        packageVersion,
+      });
+    }
+    return invoke<LocalReleasePackage | null>("historical_pick_local_package", {
+      architecture,
+    });
+  },
+  /** Inspect the fixed manifest/MSIX next to the setup executable. */
+  offlinePayloadProbe(packagePath?: string): Promise<OfflinePayloadReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ ...OFFLINE_FALLBACK_REPORT });
+    }
+    return invoke<OfflinePayloadReport>("offline_payload_probe", {
+      packagePath: packagePath ?? null,
+    });
+  },
+  /** Check 404token reachability and the signed API-key binding before install. */
+  winCheckInstallPreflight(): Promise<UsbInstallPreflightReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ apiKeyReady: true });
+    }
+    return invoke<UsbInstallPreflightReport>("win_check_install_preflight");
+  },
+  /** Stage the verified USB payload in the local temporary directory. */
+  offlinePayloadStage(packagePath?: string): Promise<OfflineStageReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        sourcePath: OFFLINE_FALLBACK_REPORT.payloadPath,
+        stagedPath: "C:\\Temp\\CodexDesktopInstaller\\26.602.3474\\OpenAI.Codex_x64.msix",
+        size: OFFLINE_FALLBACK_REPORT.size,
+        sha256: OFFLINE_FALLBACK_REPORT.sha256,
+        payload: { ...OFFLINE_FALLBACK_REPORT },
+      });
+    }
+    return invoke<OfflineStageReport>("offline_payload_stage", {
+      packagePath: packagePath ?? null,
+    });
+  },
+  /** Delete a staged payload after a successful install. */
+  offlinePayloadCleanup(stagedPath: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("offline_payload_cleanup", { stagedPath });
+  },
+  async macInstallHistoricalRelease(
+    selection: HistoricalInstallSelection,
+    blockUpdates: boolean,
+    expected: { path: string | null; build: number | null },
+    operationToken?: OperationToken,
+  ): Promise<MacInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        installed: {
+          path: expected.path ?? "/Applications/Codex.app",
+          build: 5813,
+          shortVersion: selection.version,
+          arch: selection.architecture === "x64" ? "x86_64" : "arm64",
+        },
+        status: "managed",
+      });
+    }
+    const token =
+      operationToken ??
+      (expected.path
+        ? await managerApi.armDestructive("update")
+        : await managerApi.beginTrackedOperation("install"));
+    return invoke<MacInstallStatus>("mac_install_historical_release", {
+      confirm: true,
+      token,
+      releaseTag: selection.releaseTag,
+      assetName: selection.assetName,
+      localPath: selection.localPath,
+      architecture: selection.architecture,
+      blockUpdates,
+      expectedCurrentPath: expected.path,
+      expectedCurrentBuild: expected.build,
+    }).then(guardMacStatus);
+  },
+  async winInstallHistoricalRelease(
+    selection: HistoricalInstallSelection,
+    blockUpdates: boolean,
+    expected: {
+      currentPath: string | null;
+      currentVersion: string | null;
+      currentSource: string | null;
+    },
+    operationToken?: OperationToken,
+    installRoot?: string,
+    forceMsix = false,
+    installToUsb = false,
+  ): Promise<WinPerformReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        ...WIN_FALLBACK_PERFORM,
+        installed: WIN_FALLBACK_PERFORM.installed
+          ? { ...WIN_FALLBACK_PERFORM.installed, version: selection.version }
+          : null,
+        stage: {
+          ...WIN_FALLBACK_PERFORM.stage,
+          latestVersion: selection.version,
+          packageMoniker: selection.assetName.replace(/\.msix$/i, ""),
+        },
+      });
+    }
+    const token =
+      operationToken ??
+      (expected.currentPath
+        ? await managerApi.armDestructive("update")
+        : await managerApi.beginTrackedOperation("install"));
+    const request = {
+      confirm: true,
+      token,
+      releaseTag: selection.releaseTag,
+      assetName: selection.assetName,
+      localPath: selection.localPath,
+      architecture: selection.architecture,
+      blockUpdates,
+      installRoot,
+      expected,
+      ...(forceMsix ? { forceMsix: true } : {}),
+      ...(installToUsb ? { installToUsb: true } : {}),
+    };
+    return invoke<WinPerformReport>("win_install_historical_release", request);
+  },
+  macPlanUpdate(simulatedBuild?: number): Promise<MacUpdateReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        ...FALLBACK_PLAN,
+        simulatedBuild: simulatedBuild ?? null,
+      });
+    }
+    return withUpdateCheckWatchdog(
+      invoke<MacUpdateReport>("mac_plan_update", {
+        simulatedBuild: simulatedBuild ?? null,
+      }).then(guardMacReport),
+      MAC_UPDATE_PLAN_UI_TIMEOUT_MS,
+      "mac-update-plan",
+    );
+  },
+  // Destructive: reconstruct + codesign-gate + atomic swap + relaunch (or
+  // rollback). `confirm` must be true; the backend rejects it otherwise. Guarded
+  // by a UI second confirmation before this is ever called. The expected target
+  // (from/to build + install path the user confirmed) is sent so the backend can
+  // refuse if reality drifted (appcast refresh / Codex self-update) since confirm.
+  async macPerformUpdate(expected: {
+    fromBuild: number;
+    toBuild: number;
+    path: string;
+    fromVersion: string;
+    toVersion: string;
+  }): Promise<MacPerformReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        upToDate: false,
+        fromBuild: expected.fromBuild,
+        toBuild: expected.toBuild,
+        strategy: "delta-from-3511",
+        installedPath: expected.path,
+        verified: true,
+        relaunched: true,
+        relaunchFailed: false,
+        rolledBack: false,
+        warning: null,
+        message: "（浏览器开发态：真实替换仅在桌面 app 内执行）",
+      });
+    }
+    const token = await managerApi.armDestructive("update");
+    return invoke<MacPerformReport>("mac_perform_update", {
+      confirm: true,
+      token,
+      expected,
+    });
+  },
+  // Self-update the manager itself via the Tauri updater (minisign-signed,
+  // full bundle). Endpoints + signing are server-side (see roadmap §4).
+  async checkManagerUpdate(): Promise<ManagerUpdateCheck> {
+    if (!hasTauriRuntime()) {
+      return { kind: "development" };
+    }
+    // A routine check shouldn't surface a scary error when the release feed
+    // isn't published yet or is unreachable.
+    const update = await withUpdateCheckWatchdog(
+      invoke<ManagerUpdateMetadata | null>("manager_check_update"),
+      MANAGER_UPDATE_CHECK_UI_TIMEOUT_MS,
+      "manager-update-check",
+    ).catch(() => undefined);
+    if (update === undefined) {
+      return { kind: "unavailable" };
+    }
+    if (!update) {
+      return { kind: "none" };
+    }
+    return managerUpdateAvailable(update);
+  },
+  // Codex payload update channel (docs/UPDATE-CHANNELS.md § "Channel: codex").
+  // check is read-only; apply runs only on an explicit user click and
+  // re-validates everything server-side.
+  async checkCodexPayloadUpdate(): Promise<CodexPayloadCheck> {
+    if (!hasTauriRuntime()) {
+      return { kind: "development" };
+    }
+    const update = await withUpdateCheckWatchdog(
+      invoke<UpdateInfo | null>("payload_check_codex"),
+      CODEX_PAYLOAD_CHECK_UI_TIMEOUT_MS,
+      "codex-payload-check",
+    ).catch((cause: unknown) => {
+      lastCodexPayloadError = errorMessage(cause);
+      return undefined;
+    });
+    if (update === undefined) {
+      return { kind: "unavailable", message: lastCodexPayloadError ?? "" };
+    }
+    lastCodexPayloadError = null;
+    if (!update) {
+      return { kind: "none" };
+    }
+    return { kind: "available", info: update };
+  },
+  async applyCodexPayloadUpdate(info: UpdateInfo): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.reject(new Error("payload update requires the desktop app"));
+    }
+    return invoke<void>("payload_apply_codex", { info });
+  },
+  macStatus(): Promise<MacInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ installed: null, status: "none" });
+    }
+    return invoke<MacInstallStatus>("mac_status").then(guardMacStatus);
+  },
+  macAdopt(): Promise<MacInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ installed: null, status: "managed" });
+    }
+    return invoke<MacInstallStatus>("mac_adopt");
+  },
+  macPickExistingInstall(): Promise<MacInstallStatus["installed"] | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        path: "/Users/example/Desktop/Codex.app",
+        build: 4041,
+        shortVersion: "26.623.31443",
+        arch: "arm64",
+      });
+    }
+    return invoke<MacInstallStatus["installed"] | null>(
+      "mac_pick_existing_install",
+    );
+  },
+  macAdoptPath(path: string): Promise<MacInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        installed: {
+          path,
+          build: 4041,
+          shortVersion: "26.623.31443",
+          arch: "arm64",
+        },
+        status: "managed",
+      });
+    }
+    return invoke<MacInstallStatus>("mac_adopt_path", { path });
+  },
+
+  // Fresh-install the latest Codex (full package) into /Applications.
+  macInstall(expected: {
+    targetBuild: number;
+    targetVersion: string;
+  }): Promise<MacInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        installed: {
+          path: "/Applications/Codex.app",
+          build: 3575,
+          shortVersion: "26.602.30954",
+          arch: "arm64",
+        },
+        status: "managed",
+      });
+    }
+    return invoke<MacInstallStatus>("mac_install", {
+      expectedTargetBuild: expected.targetBuild,
+      expectedTargetVersion: expected.targetVersion,
+    });
+  },
+  macPauseDownload(operationId: string): Promise<boolean> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(true);
+    }
+    return invoke<boolean>("mac_pause_download", { operationId });
+  },
+  macCancelDownload(operationId: string): Promise<boolean> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(true);
+    }
+    return invoke<boolean>("mac_cancel_download", { operationId });
+  },
+  // Discard a PAUSED download's cached partial (paused-state cancel).
+  macDiscardDownload(): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("mac_discard_download");
+  },
+  // Open the installed Codex — explicit user action after install (we no longer
+  // auto-launch).
+  macLaunch(): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("mac_launch_codex");
+  },
+  // Open an external URL in the system browser (a webview <a target=_blank> is a
+  // no-op under Tauri).
+  openUrl(url: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      window.open(url, "_blank");
+      return Promise.resolve();
+    }
+    return invoke<void>("open_url", { url });
+  },
+  getDiagnostics(): Promise<Diagnostics> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        ...FALLBACK_DIAGNOSTICS,
+        generatedAtUnix: Math.floor(Date.now() / 1000),
+      });
+    }
+    return invoke<Diagnostics>("get_diagnostics");
+  },
+  getHostArchitecture(): Promise<string> {
+    if (!hasTauriRuntime()) {
+      const platform = navigator.platform.toLowerCase();
+      return Promise.resolve(platform.includes("arm") ? "aarch64" : "x86_64");
+    }
+    return invoke<string>("get_host_architecture");
+  },
+  openLogsDir(): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("open_logs_dir");
+  },
+  openCodexHome(): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("open_codex_home");
+  },
+  reportFrontendError(payload: FrontendErrorPayload): Promise<void> {
+    if (!hasTauriRuntime()) {
+      console.error("[frontend]", payload);
+      return Promise.resolve();
+    }
+    return invoke<void>("log_frontend_error", { payload }).catch((cause) => {
+      console.error("[frontend]", payload, cause);
+    });
+  },
+  frontendReady(
+    lang: string,
+    generation: number,
+    token: string,
+  ): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("frontend_ready", { lang, generation, token });
+  },
+
+  // Settings (update source + general). The backend persists them so the source
+  // choice actually drives which appcast the update flow reads.
+  async getSettings(): Promise<AppSettings> {
+    if (!hasTauriRuntime()) {
+      return localSettings();
+    }
+    try {
+      return normalizeSettings(await invoke<AppSettings>("get_settings"));
+    } catch {
+      return localSettings();
+    }
+  },
+  async setSettings(next: AppSettings): Promise<AppSettings> {
+    const safe = normalizeSettings(next);
+    if (!hasTauriRuntime()) {
+      localStorage.setItem(SETTINGS_LS, JSON.stringify(safe));
+      emitSettingsChanged(safe);
+      return safe;
+    }
+    const saved = normalizeSettings(
+      await invoke<AppSettings>("set_settings", { settings: safe }),
+    );
+    localStorage.setItem(SETTINGS_LS, JSON.stringify(saved));
+    emitSettingsChanged(saved);
+    return saved;
+  },
+  // The user confirmed the close dialog — tell the backend to actually exit
+  // (the window/exit guards otherwise hold the close to ask first).
+  confirmQuit(): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("confirm_quit");
+  },
+  // The USB uninstall helper waits for this manager process.  The renderer
+  // calls the dedicated command only after it has shown the pending result;
+  // unlike confirmQuit, it cannot be used without an armed uninstall handoff.
+  getUninstallHandoff(): Promise<UninstallHandoffStatus | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<UninstallHandoffStatus | null>("get_uninstall_handoff");
+  },
+  completeUninstallHandoff(handoffId: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("complete_uninstall_handoff", { handoffId });
+  },
+  winPickInstallDir(): Promise<string | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(localSettings().installRoot);
+    }
+    return invoke<string | null>("win_pick_install_dir");
+  },
+  winDefaultInstallRoot(): Promise<string> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(DEFAULT_SETTINGS.installRoot);
+    }
+    return invoke<string>("win_default_install_root");
+  },
+  async winSetInstallRoot(path: string): Promise<AppSettings> {
+    if (!hasTauriRuntime()) {
+      const saved = { ...localSettings(), installRoot: path };
+      localStorage.setItem(SETTINGS_LS, JSON.stringify(saved));
+      emitSettingsChanged(saved);
+      return saved;
+    }
+    const saved = normalizeSettings(
+      await invoke<AppSettings>("win_set_install_root", { path }),
+    );
+    localStorage.setItem(SETTINGS_LS, JSON.stringify(saved));
+    emitSettingsChanged(saved);
+    return saved;
+  },
+  async winResetInstallRoot(): Promise<AppSettings> {
+    if (!hasTauriRuntime()) {
+      const saved = {
+        ...localSettings(),
+        installRoot: DEFAULT_SETTINGS.installRoot,
+      };
+      localStorage.setItem(SETTINGS_LS, JSON.stringify(saved));
+      emitSettingsChanged(saved);
+      return saved;
+    }
+    const saved = normalizeSettings(
+      await invoke<AppSettings>("win_reset_install_root"),
+    );
+    localStorage.setItem(SETTINGS_LS, JSON.stringify(saved));
+    emitSettingsChanged(saved);
+    return saved;
+  },
+
+  // Launch-at-login (off by default). Backed by tauri-plugin-autostart.
+  getAutostart(): Promise<boolean> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(false);
+    }
+    return invoke<boolean>("get_autostart");
+  },
+  // ── Codex UI themes ────────────────────────────────────────────────────
+  /** Locally installed theme packages (managed dir + optional dev dir). */
+  codexThemeList(): Promise<CodexThemeSummary[]> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(BROWSER_FALLBACK_THEMES);
+    }
+    return invoke<CodexThemeSummary[]>("codex_theme_list");
+  },
+  codexThemeStatus(): Promise<CodexThemeStatusReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ ...BROWSER_FALLBACK_THEME_STATUS });
+    }
+    return invoke<CodexThemeStatusReport>("codex_theme_status");
+  },
+  /** Live try-on against an already-debuggable Codex. Not persisted. */
+  codexThemeTryOn(themeRef: string): Promise<CodexThemeStatusReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        ...BROWSER_FALLBACK_THEME_STATUS,
+        daemon: null,
+      });
+    }
+    return invoke<CodexThemeStatusReport>("codex_theme_try_on", { themeRef });
+  },
+  /** Try-on that restarts Codex into debug mode first; persists nothing. */
+  codexThemeTryOnRestart(themeRef: string): Promise<CodexThemeStatusReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ ...BROWSER_FALLBACK_THEME_STATUS });
+    }
+    return invoke<CodexThemeStatusReport>("codex_theme_try_on_restart", {
+      themeRef,
+    });
+  },
+  /** Persist the current try-on as the standing selection. */
+  codexThemeKeep(themeRef: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("codex_theme_keep", { themeRef });
+  },
+  /** Delete a managed skin from the store dir (store copy only; refuses the
+   *  active selection and never touches a dev checkout). */
+  codexThemeDelete(themeRef: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("codex_theme_delete", { themeRef });
+  },
+  /** Full apply: restart Codex debuggable + native config sections + inject. */
+  codexThemeApply(themeRef: string): Promise<CodexThemeStatusReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        ...BROWSER_FALLBACK_THEME_STATUS,
+        activeTheme: themeRef,
+      });
+    }
+    return invoke<CodexThemeStatusReport>("codex_theme_apply", { themeRef });
+  },
+  /** Turn the theme off. `full` restores every managed native unit from the
+   *  baseline and clears the selection; otherwise it only pauses the CSS
+   *  injection for this session (native palette stays enabled). */
+  codexThemeOff(full: boolean): Promise<CodexThemeStatusReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        ...BROWSER_FALLBACK_THEME_STATUS,
+        activeTheme: null,
+      });
+    }
+    return invoke<CodexThemeStatusReport>("codex_theme_off", { full });
+  },
+  /** Cancel an unkept try-on: CSS off + restore the pre-try-on native
+   *  settings from the stash. */
+  codexThemeCancel(): Promise<CodexThemeStatusReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ ...BROWSER_FALLBACK_THEME_STATUS });
+    }
+    return invoke<CodexThemeStatusReport>("codex_theme_cancel");
+  },
+  /** Pick and install a .codexskin; null when the user cancels the picker. */
+  codexThemeImport(): Promise<CodexThemeSummary | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<CodexThemeSummary | null>("codex_theme_import");
+  },
+  /** Install a .codexskin from an explicit path (drag-and-drop). */
+  codexThemeImportPath(path: string): Promise<CodexThemeSummary> {
+    if (!hasTauriRuntime()) {
+      return Promise.reject(new Error("import requires the desktop app"));
+    }
+    return invoke<CodexThemeSummary>("codex_theme_import_path", { path });
+  },
+  /** Cover preview as a data URL; null when the package ships none. */
+  codexThemePreview(themeRef: string): Promise<string | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<string | null>("codex_theme_preview", { themeRef });
+  },
+  /** Online skin catalog (skins.agentsmirror.com). */
+  codexThemeCatalog(): Promise<CatalogSkin[]> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(BROWSER_FALLBACK_CATALOG);
+    }
+    return invoke<CatalogSkin[]>("codex_theme_catalog");
+  },
+  /** Catalog cover preview as a data URL. */
+  codexThemeCatalogPreview(preview: string, version: string): Promise<string> {
+    if (!hasTauriRuntime()) {
+      return Promise.reject(new Error("catalog requires the desktop app"));
+    }
+    return invoke<string>("codex_theme_catalog_preview", { preview, version });
+  },
+  /** Pick a new skin-store directory and migrate skins; null on cancel. */
+  codexThemePickStoreDir(): Promise<StoreMigrationReport | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(null);
+    }
+    return invoke<StoreMigrationReport | null>("codex_theme_pick_store_dir");
+  },
+  /** Reveal the current skin store in Finder/Explorer. */
+  codexThemeOpenStore(): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("codex_theme_open_store");
+  },
+  /** Download, verify and install one catalog skin. */
+  codexThemeInstallOnline(skinId: string): Promise<CodexThemeSummary> {
+    if (!hasTauriRuntime()) {
+      return Promise.reject(new Error("catalog requires the desktop app"));
+    }
+    return invoke<CodexThemeSummary>("codex_theme_install_online", { skinId });
+  },
+  /** Switch the native window between compact and expanded. `size` is the
+   *  remembered expanded size (logical px); the report echoes what was applied
+   *  after work-area clamping. The browser preview has no native window, so it
+   *  echoes the request and the layout switches on CSS alone. */
+  setWindowMode(
+    mode: WindowMode,
+    size?: { width: number; height: number },
+  ): Promise<WindowModeReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        mode,
+        width: size?.width ?? (mode === "expanded" ? 1100 : 400),
+        height: size?.height ?? (mode === "expanded" ? 720 : 640),
+      });
+    }
+    return invoke<WindowModeReport>("set_window_mode", {
+      mode,
+      width: size?.width,
+      height: size?.height,
+    });
+  },
+  setAutostart(enabled: boolean): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("set_autostart", { enabled });
+  },
+
+  // Destructive: remove the Codex app and its per-user data. The uninstall UI
+  // always passes false so ~/.codex is purged after an explicit confirmation.
+  async macUninstall(keepCodexHome: boolean): Promise<MacUninstallReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        removed: true,
+        keptCodexHome: keepCodexHome,
+        message: keepCodexHome
+          ? "（浏览器开发态）已卸载,保留数据"
+          : "（浏览器开发态）已卸载并清除数据",
+        outcome: emptyOperationOutcome({
+          primaryOk: true,
+          appState: "absent",
+          installClass: "none",
+          cleanup: {
+            state: keepCodexHome ? "skipped" : "ok",
+            detail: keepCodexHome ? "kept user data" : null,
+          },
+        }),
+      });
+    }
+    const token = await managerApi.armDestructive("uninstall");
+    return invoke<MacUninstallReport>("mac_uninstall", {
+      confirm: true,
+      token,
+      keepCodexHome,
+    });
+  },
+  getConfigHealth(): Promise<ConfigHealth> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ ...FALLBACK_CONFIG_HEALTH });
+    }
+    return invoke<ConfigHealth>("get_config_health");
+  },
+  restoreConfigBackup(which: ConfigWhich): Promise<ConfigHealth> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ ...FALLBACK_CONFIG_HEALTH });
+    }
+    return invoke<ConfigHealth>("restore_config_backup", { which });
+  },
+  resetConfig(which: ConfigWhich): Promise<ConfigHealth> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({ ...FALLBACK_CONFIG_HEALTH });
+    }
+    return invoke<ConfigHealth>("reset_config", { which });
+  },
+  async retryAncillary(
+    request: AncillaryRetryRequest,
+  ): Promise<AncillaryRetryReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        message: "browser-dev mock: ancillary retry ok",
+        outcome: emptyOperationOutcome({
+          primaryOk: true,
+          appState: "unknown",
+          installClass: null,
+        }),
+      });
+    }
+    // purge_user_data is destructive — arm the same uninstall token as a full
+    // uninstall so recovery cannot one-click wipe ~/.codex.
+    const wantsPurge =
+      Boolean(request.purgeUserData) &&
+      request.actions.includes("purge_user_data");
+    if (wantsPurge) {
+      const token = await managerApi.armDestructive("uninstall");
+      return invoke<AncillaryRetryReport>("retry_ancillary", {
+        request,
+        confirm: true,
+        token,
+      });
+    }
+    return invoke<AncillaryRetryReport>("retry_ancillary", {
+      request,
+      confirm: null,
+      token: null,
+    });
+  },
+  winPlanUpdate(): Promise<WinUpdateReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(WIN_FALLBACK_PLAN);
+    }
+    return withUpdateCheckWatchdog(
+      invoke<WinUpdateReport>("win_plan_update").then(guardWinReport),
+      WINDOWS_UPDATE_PLAN_UI_TIMEOUT_MS,
+      "windows-update-plan",
+    );
+  },
+  winPauseDownload(operationId: string): Promise<boolean> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(true);
+    }
+    return invoke<boolean>("win_pause_download", { operationId });
+  },
+  winCancelDownload(operationId: string): Promise<boolean> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve(true);
+    }
+    return invoke<boolean>("win_cancel_download", { operationId });
+  },
+  // Discard a PAUSED download's cached partial (paused-state cancel).
+  winDiscardDownload(): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return invoke<void>("win_discard_download");
+  },
+  async winPerformUpdate(
+    confirm: boolean,
+    expected: {
+      currentVersion: string | null;
+      latestVersion: string;
+      packageMoniker: string;
+      route: string;
+    },
+    installRoot?: string,
+    operationToken?: OperationToken,
+    resumeKind: "install" | "perform" = "perform",
+  ): Promise<WinPerformReport> {
+    if (!hasTauriRuntime()) {
+      return confirm
+        ? Promise.resolve(WIN_FALLBACK_PERFORM)
+        : Promise.reject(new Error("explicit confirmation is required"));
+    }
+    if (!confirm) {
+      return Promise.reject(new Error("explicit confirmation is required"));
+    }
+    const token = operationToken ?? (await managerApi.armDestructive("update"));
+    return invoke<WinPerformReport>("win_perform_update", {
+      confirm,
+      token,
+      installRoot: installRoot ?? null,
+      expected,
+      resumeKind,
+    });
+  },
+  async winUninstall(
+    confirm: boolean,
+    purgeUserData: boolean,
+  ): Promise<WinUninstallReport> {
+    if (!hasTauriRuntime()) {
+      return confirm
+        ? Promise.resolve({
+            ...WIN_FALLBACK_UNINSTALL,
+            purgedUserData: purgeUserData,
+          })
+        : Promise.reject(new Error("explicit confirmation is required"));
+    }
+    if (!confirm) {
+      return Promise.reject(new Error("explicit confirmation is required"));
+    }
+    const token = await managerApi.armDestructive("uninstall");
+    return invoke<WinUninstallReport>("win_uninstall", {
+      confirm,
+      token,
+      purgeUserData,
+    });
+  },
+  /** Windows USB build: remove Codex and the locally copied CCSwitch bundle
+   * in one guarded operation. The USB installation kit is always retained so
+   * the drive remains immediately reusable for a future reinstall. */
+  async winUninstallBundle(
+    confirm: boolean,
+    purgeUserData: boolean,
+    purgeCcswitchData: boolean,
+    forceCleanup = false,
+  ): Promise<WinBundleUninstallReport> {
+    if (!hasTauriRuntime()) {
+      if (!confirm) {
+        return Promise.reject(new Error("explicit confirmation is required"));
+      }
+      return Promise.resolve({
+        ...WIN_FALLBACK_BUNDLE_UNINSTALL,
+        purgedUserData: purgeUserData,
+        purgedCcswitchData: purgeCcswitchData,
+        ccswitch: {
+          ...CCSWITCH_FALLBACK_UNINSTALL,
+          purgedUserData: purgeCcswitchData,
+        },
+      });
+    }
+    if (!confirm) {
+      return Promise.reject(new Error("explicit confirmation is required"));
+    }
+    const token = await managerApi.armDestructive("uninstall");
+    return invoke<WinBundleUninstallReport>("win_uninstall_bundle", {
+      confirm,
+      token,
+      purgeUserData,
+      purgeCcswitchData,
+      forceCleanup,
+      // Keep the offline kit available for reinstall. The optional backend
+      // field remains for compatibility with older managers, but current
+      // callers must never authorize source-media deletion.
+      removeUsbMedia: false,
+    });
+  },
+  winStatus(): Promise<WinInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        installed: WIN_FALLBACK_INSTALLED,
+        status: "managed",
+      });
+    }
+    return invoke<WinInstallStatus>("win_status").then(guardWinStatus);
+  },
+  winAdopt(): Promise<WinInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        installed: WIN_FALLBACK_PLAN.installed,
+        status: "managed",
+      });
+    }
+    return invoke<WinInstallStatus>("win_adopt");
+  },
+  winPickExistingInstall(): Promise<WinInstallStatus["installed"] | null> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        path: "E:\\Tools\\Codex",
+        version: "26.623.31921",
+        arch: "x64",
+        source: "portable",
+        packageFamilyName: null,
+        installedAt: Math.floor(Date.now() / 1000),
+      });
+    }
+    return invoke<WinInstallStatus["installed"] | null>(
+      "win_pick_existing_install",
+    );
+  },
+  winAdoptPath(path: string): Promise<WinInstallStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        installed: {
+          path,
+          version: "26.623.31921",
+          arch: "x64",
+          source: "portable",
+          packageFamilyName: null,
+          installedAt: Math.floor(Date.now() / 1000),
+        },
+        status: "managed",
+      });
+    }
+    return invoke<WinInstallStatus>("win_adopt_path", { path });
+  },
+  // Open the installed Codex — explicit user action (mirrors macLaunch).
+  usbHostStatus(): Promise<UsbHostStatus> {
+    if (!hasTauriRuntime()) return Promise.resolve({ required: false, ready: true,
+      accountReady: true, capabilitiesReady: true, conflict: false, message: "" });
+    return invoke<UsbHostStatus>("usb_host_status");
+  },
+  initializeUsbHost(replaceAccount = false): Promise<UsbHostStatus> {
+    if (!hasTauriRuntime()) return this.usbHostStatus();
+    return invoke<UsbHostStatus>("initialize_usb_host", { replaceAccount });
+  },
+  winLaunch(locale?: string): Promise<void> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve();
+    }
+    return locale
+      ? invoke<void>("win_launch_codex", { locale })
+      : invoke<void>("win_launch_codex");
+  },
+  usbClaudeStatus(): Promise<"install" | "prepare" | "recover" | "ready"> {
+    return invoke("usb_claude_status");
+  },
+  usbClaudeOpen(): Promise<void> {
+    return invoke("usb_claude_open");
+  },
+  usbClaudePrepare(): Promise<void> {
+    return invoke("usb_claude_prepare");
+  },
+  usbClaudeSyncSkills(): Promise<void> {
+    return invoke("usb_claude_sync_skills");
+  },
+  usbClaudeUpdate(): Promise<boolean> {
+    return invoke("usb_claude_update");
+  },
+  /** Launch the bundled Codex Switch configurator (USB-direct in the offline bundle). */
+  installAndLaunchCcswitch(): Promise<CcswitchLaunchReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        available: false,
+        installed: false,
+        launched: false,
+        sourcePath: null,
+        installedPath: null,
+        copiedFiles: 0,
+        message: "browser preview: CCSwitch launch is unavailable",
+      });
+    }
+    return invoke<CcswitchLaunchReport>("install_and_launch_ccswitch");
+  },
+  /** Restore/open CCSwitch without reapplying the one-time background hide. */
+  openCcswitch(): Promise<CcswitchLaunchReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        available: false,
+        installed: false,
+        launched: false,
+        sourcePath: null,
+        installedPath: null,
+        copiedFiles: 0,
+        message: "browser preview: CCSwitch open is unavailable",
+      });
+    }
+    return invoke<CcswitchLaunchReport>("open_ccswitch");
+  },
+  /** Read or explicitly mutate the manager-owned Codex model catalog. */
+  manageNativeModelCatalog(request: NativeModelCatalogActionRequest): Promise<NativeModelCatalogActionReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        status: "unavailable",
+        modelIds: [],
+        restartRequired: false,
+        message: "browser preview: native model catalog is unavailable",
+      });
+    }
+    return invoke<NativeModelCatalogActionReport>("manage_native_model_catalog", { request });
+  },
+  /** Explicit, read-only 404token directory and gateway diagnostics. */
+  gatewayModelProbe(request: GatewayModelProbeRequest): Promise<GatewayModelProbeReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        status: "skipped", endpoint: "", credentialFingerprint: "", connectionFingerprint: "", checkedAt: 0,
+        models: [], results: [], generatedRequests: 0, errorCode: "tauri-runtime-unavailable",
+      });
+    }
+    return invoke<GatewayModelProbeReport>("gateway_model_probe", { request });
+  },
+  cancelGatewayModelProbe(requestId: string): Promise<boolean> {
+    if (!hasTauriRuntime()) return Promise.resolve(false);
+    return invoke<boolean>("cancel_gateway_model_probe", { requestId });
+  },
+  /** Read the licensed upstream model directory for automatic media setup. */
+  mediaModelCatalog(): Promise<MediaModelCatalog> {
+    if (!hasTauriRuntime()) return Promise.resolve({ models: [] });
+    return invoke<MediaModelCatalog>("media_model_catalog");
+  },
+  /** Read local non-secret media model settings without contacting the upstream. */
+  mediaModelSettings(): Promise<LocalMediaModelSettings> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        licensedCredentialAvailable: false,
+        mediaGenerationAgentId: "",
+        image2Model: "",
+        grokImageModel: "",
+        grokVideoModel: "",
+        seedanceModel: "",
+        minimaxVideoModel: "",
+      });
+    }
+    return invoke<LocalMediaModelSettings>("media_model_settings");
+  },
+  accountStatus(): Promise<AccountStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        bound: false,
+        accountName: null,
+        loggedIn: false,
+        balance: null,
+        usage: null,
+        message: "browser preview: account unavailable",
+      });
+    }
+    return invoke<AccountStatus>("account_status");
+  },
+  accountLogin(password: string): Promise<AccountStatus> {
+    if (!hasTauriRuntime()) return browserSkillRepoUnavailable();
+    return invoke<AccountStatus>("account_login", { password });
+  },
+  accountRefresh(): Promise<AccountStatus> {
+    if (!hasTauriRuntime()) return browserSkillRepoUnavailable();
+    return invoke<AccountStatus>("account_refresh");
+  },
+  accountRedeem(code: string): Promise<AccountStatus> {
+    if (!hasTauriRuntime()) return browserSkillRepoUnavailable();
+    return invoke<AccountStatus>("account_redeem", { code });
+  },
+  /** Inspect the bundled offline Skills/MCP/Agents capability pack. */
+  capabilityPackStatus(): Promise<CapabilityPackReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        available: false,
+        installed: false,
+        success: false,
+        coreReady: false,
+        overallStatus: "failed",
+        sourcePath: null,
+        packVersion: null,
+        skills: 0,
+        agents: 0,
+        runtimeReady: false,
+        runtimeStatus: "unknown",
+        configStatus: "unknown",
+        diagnosticsPath: null,
+        feishuEnabled: false,
+        enabledApiServices: [],
+        mediaRuntimeStatus: "unknown",
+        mediaProtocolStatus: "unknown",
+        mediaGatewayCatalogStatus: "not-checked",
+        mediaGatewayModelCount: 0,
+        mediaGatewayCatalogVerifiedAt: null,
+        mediaGenerationCapability: "unknown",
+        codexRestartRequired: false,
+        codexRunning: false,
+        message: "browser preview: capability pack status is unavailable",
+      });
+    }
+    return invoke<CapabilityPackReport>("capability_pack_status");
+  },
+  /** Install or repair the complete offline capability pack. */
+  installCapabilityPack(
+    options: CapabilityPackInstallOptions,
+    preserveExisting = false,
+  ): Promise<CapabilityPackReport> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        available: false,
+        installed: false,
+        success: false,
+        coreReady: false,
+        overallStatus: "failed",
+        sourcePath: null,
+        packVersion: null,
+        skills: 0,
+        agents: 0,
+        runtimeReady: false,
+        runtimeStatus: "unknown",
+        configStatus: "unknown",
+        diagnosticsPath: null,
+        feishuEnabled: false,
+        enabledApiServices: [],
+        mediaRuntimeStatus: "unknown",
+        mediaProtocolStatus: "unknown",
+        mediaGatewayCatalogStatus: "not-checked",
+        mediaGatewayModelCount: 0,
+        mediaGatewayCatalogVerifiedAt: null,
+        mediaGenerationCapability: "unknown",
+        codexRestartRequired: false,
+        codexRunning: false,
+        message: "browser preview: capability pack installation is unavailable",
+      });
+    }
+    return invoke<CapabilityPackReport>("install_capability_pack", { options, preserveExisting });
+  },
+  /** Inspect the independent unsigned Skill Hub overlay. */
+  skillRepoCheckUpdate(): Promise<SkillRepoUpdateInfo> {
+    if (!hasTauriRuntime()) {
+      return browserSkillRepoUnavailable();
+    }
+    return invoke<SkillRepoUpdateInfo>("skill_repo_check_update").then((info) => ({
+      ...info,
+      attempts: sanitizeSkillRepoAttempts(info.attempts),
+    }));
+  },
+  /** Apply the exact identity returned by skillRepoCheckUpdate. */
+  skillRepoApplyUpdate(expected: SkillRepoExpected): Promise<SkillRepoApplyReport> {
+    if (!hasTauriRuntime()) {
+      return browserSkillRepoUnavailable();
+    }
+    return invoke<SkillRepoApplyReport>("skill_repo_apply_update", { expected });
+  },
+  /** Roll back the last complete Skill Hub generation. */
+  skillRepoRollback(): Promise<SkillRepoRollbackReport> {
+    if (!hasTauriRuntime()) {
+      return browserSkillRepoUnavailable();
+    }
+    return invoke<SkillRepoRollbackReport>("skill_repo_rollback");
+  },
+  /** Read the local USB lease/watchdog snapshot (no mutation). */
+  usbGuardStatus(): Promise<UsbGuardStatus> {
+    if (!hasTauriRuntime()) {
+      return Promise.resolve({
+        schemaVersion: 1,
+        status: "disabled",
+        watchdog: "not-running",
+        removable: false,
+        driveRoot: null,
+        bundlePath: null,
+        bundleRelativePath: null,
+        signed: false,
+        signatureState: "not-applicable",
+        codexAllowed: false,
+        codexBlockReason: "browser preview: USB guard is unavailable",
+        lastCheckedAtMs: Date.now(),
+        missingSinceMs: null,
+        countdownSeconds: null,
+        managedProcesses: [],
+        message: "browser preview: USB guard is unavailable",
+      });
+    }
+    return invoke<UsbGuardStatus>("usb_guard_status");
+  },
+};
+
+function managerUpdateAvailable(
+  update: ManagerUpdateMetadata,
+): ManagerUpdateAvailable {
+  return {
+    kind: "available",
+    version: update.version,
+    currentVersion: update.currentVersion,
+    body: update.body,
+    installAndRelaunch: async () => {
+      await invoke<void>("manager_install_update", {
+        expectedVersion: update.version,
+        expectedCurrentVersion: update.currentVersion,
+      });
+      await relaunch();
+    },
+    discard: async () => {},
+  };
+}

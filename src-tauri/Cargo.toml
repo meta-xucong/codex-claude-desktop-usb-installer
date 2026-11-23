@@ -1,0 +1,93 @@
+[package]
+name = "codex-app-manager"
+# The GUI app is the only [[bin]]. Dev/test harnesses live in examples/ (e.g.
+# examples/win_real_smoke.rs) so cargo and tauri never build or bundle them into
+# the .app — tauri's bundler copies every bin target, so a harness under src/bin/
+# would otherwise ride along in the production app. default-run is kept
+# defensively to pin `cargo run` to the app should another src/bin/* be added.
+default-run = "codex-app-manager"
+version = "0.5.25"
+description = "A cross-platform manager for installing and updating mirrored official Codex desktop app packages."
+authors = ["Wangnov"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Wangnov/Codex-App-Manager"
+
+[features]
+# Tauri uses this feature to switch the application from the development
+# server (`devUrl`) to its embedded `frontendDist` assets.  The USB build is
+# always offline, so the release binary must be compiled with this feature.
+custom-protocol = ["tauri/custom-protocol"]
+# Formal USB builds reject missing/unsigned/unknown-key licenses before any
+# WebView2/VC/recovery/lease side effect. Development builds keep the
+# explicit unsigned auto-enrolment path for local assembly.
+signed-required = []
+# Separate, explicitly signed diagnostic manager target. Its USB guard state and
+# helper use a dedicated namespace; the ordinary manager remains unchanged.
+usb-cdp-diagnostic = ["custom-protocol", "signed-required"]
+# USB helper integration retained from the tested November USB builds.
+# Keep the historical feature name to match those builds and their resources.
+usb-cua-helper-mta-experiment = ["custom-protocol", "signed-required"]
+
+[[bin]]
+name = "codex-app-manager"
+path = "src/main.rs"
+
+[[bin]]
+name = "codex-usb-cdp-diagnostic"
+path = "src/diagnostic_main.rs"
+required-features = ["usb-cdp-diagnostic"]
+
+[lib]
+name = "codex_app_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+ed25519-dalek = "3"
+serde_json = "1.0"
+sha2 = "0.11"
+url = "2.5"
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+base64 = "0.23"
+codex-usb-license = { path = "../crates/codex-usb-license" }
+codex-mac-engine = { path = "../crates/codex-mac-engine" }
+codex-theme-engine = { path = "../crates/codex-theme-engine" }
+codex-win-engine = { path = "../crates/codex-win-engine" }
+directories = "6.0.0"
+ed25519-dalek = "3"
+fs4 = "1.1"
+log = "0.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls", "socks", "system-proxy"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+toml = "0.8.2"
+toml_edit = "0.20.2"
+tauri = { version = "2.11.2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-log = "2"
+tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+thiserror = "2.0"
+tokio = { version = "1", features = ["sync", "time"] }
+url = "2.5"
+uuid = { version = "1", features = ["v4"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+sha1 = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Keep these pinned to Tauri/Wry's WebView2 ABI: the platform handle returned
+# by `WebviewWindow::with_webview` exposes these exact COM interfaces.
+webview2-com = "=0.38.2"
+windows-core = "0.61.2"

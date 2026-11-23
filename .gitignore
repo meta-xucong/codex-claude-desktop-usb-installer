@@ -1,0 +1,71 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+.devserver/
+**/__pycache__/
+*.pyc
+
+.DS_Store
+*.log
+*.tmp
+
+.env
+.env.*
+!.env.example
+
+# Vendored Sparkle BinaryDelta helper (macOS delta updates) — fetched by
+# scripts/vendor-binary-delta.sh, not committed (~1.4 MB universal binary).
+src-tauri/resources/BinaryDelta
+
+# Release payloads are archived separately from Git history.  The Codex MSIX
+# is ~802 MB and GitHub rejects regular Git blobs over 100 MB.  Keep the
+# generated wrapper/metadata available for local USB builds, but never add the
+# large signed payload to commits by accident.
+release/**
+release/**/payload/*.msix
+release/upstream/*.Msix
+release/upstream/*.msix
+
+# Complete WebView2 standalone runtime is >100 MB; distribute with the USB
+# artifact, not as a Git blob. Source URL and SHA-256 are pinned in code/tools.
+src-tauri/resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe
+release/**/resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe
+
+# Only the recommended one-click layout is kept as a lightweight build
+# snapshot.  Other generated layouts are reproducible and contain duplicate
+# executables, so leave them out of the archive.
+release/setup/
+release/usb/
+release/usb-final/
+release/upstream/
+
+# Versioned USB kits are generated release artifacts (roughly 1.1 GB each).
+# Publish a chosen final kit as a GitHub Release asset; never commit its
+# duplicated executables, signed MSIX, or offline runtimes to Git history.
+release/usb-oneclick-v*/
+
+# Local investigation snapshots, cloned build inputs, and machine-specific
+# release material. These are intentionally kept outside GitHub source history.
+/.analysis/
+/.workbuddy/
+/codex-learnings/
+/CCSwitch/
+/app/resources/
+/models_cache.json
+/release-profiles/
+/src-tauri/target-g*/
+/tools/usb-license-signer/target-*/
+
+# Local validation snapshots and third-party offline prerequisite binaries are
+# reproducible inputs, not source. Their expected hashes/signers are release
+# gates in tools/build-installer.ps1.
+.test-tmp/
+.codex-audit/
+src-tauri/resources/prerequisites/*.exe
+
+# Offline distribution inputs; retain their existing release manifests in Git.
+installer-pack/runtime/bundled/chrome-headless-shell-152.0.7977.30-win64.zip
+installer-pack/runtime/bundled/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip
+installer-pack/runtime/bundled/hyperframes-0.8.134-win-x64-node-modules.zip
