@@ -37,7 +37,7 @@ function SyncShared($kind) {
     try {
         try { $locked = $mutex.WaitOne() } catch [Threading.AbandonedMutexException] { $locked = $true }
         $parts = switch ($kind) {
-            'prepare' { 'skills','models','connections' }
+            'prepare' { 'skills','connections' }
             'capabilities' { 'skills','connections' }
             default { $kind }
         }
@@ -47,14 +47,27 @@ function SyncShared($kind) {
             & $python -I -c "import os;exec(os.environ.pop('CAM_CLAUDE_SHARED'))" $part (Join-Path $runtime 'claude.exe') $profilePath $base
             if ($LASTEXITCODE -ne 0) { throw 'Claude capability sync failed' }
         }
-        if ($kind -ceq 'prepare') {
-            Show-InstallStep 'finalize'
-            PutText $sharedReady ($env:CAM_CLAUDE_ID + '|' + $env:CAM_CLAUDE_PIPE)
+        if ($kind -in 'prepare','capabilities') {
+            if ($kind -ceq 'prepare') { Show-InstallStep 'finalize' }
+            # Preserve the outstanding provider migration until ConfigureDesktopProvider runs.
+            if (!$legacyModels -or $action -in 'open','prepare') {
+                PutText $sharedReady ($env:CAM_CLAUDE_ID + '|' + $env:CAM_CLAUDE_PIPE + '|shared-v4')
+            }
         }
+    } catch {
+        if ($kind -ne 'models' -and (!$legacyModels -or $action -in 'open','prepare')) {
+            try { PutText $sharedReady ($env:CAM_CLAUDE_ID+'|'+$env:CAM_CLAUDE_PIPE+'|components-pending') } catch { }
+        }
+        throw
     } finally {
         if ($locked) { $mutex.ReleaseMutex() }
         $mutex.Dispose()
     }
+}
+
+# Component repair reports these failures separately from desktop activation.
+function SyncForDesktop($kind) {
+    try { SyncShared $kind } catch { Write-Verbose "Claude components need repair." }
 }
 
 function RuntimeReady {
@@ -110,30 +123,11 @@ function RunningApp($exe) {
         $_.SessionId -eq (Get-Process -Id $PID).SessionId -and $_.Path -and $_.Path -ieq $exe
     })
 }
-# Electron registers three values in the user's classic URL handler when the
-# offline preseed copy opens. The installed MSIX has its own protocol declaration.
+# Recover a temporary protocol handler left by the previous MSIX seed worker.
 $protocolClass = 'Software\Classes\claude'
 $protocolSubkeys = @('', '\shell', '\shell\open', '\shell\open\command')
 function SeedProtocolBackup($stageExe) {
     Join-Path $base ((Split-Path (Split-Path $stageExe) -Leaf) + '.protocol.json')
-}
-function SaveSeedProtocol($stageExe) {
-    $keys = foreach ($sub in $protocolSubkeys) {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($protocolClass + $sub)
-        try {
-            $values = @(if ($key) {
-                foreach ($name in $key.GetValueNames()) {
-                    if (($sub -eq '' -and $name -in @('','URL Protocol')) -or
-                        ($sub -eq '\shell\open\command' -and $name -eq '')) {
-                        @{ name=$name; kind=$key.GetValueKind($name).ToString()
-                           data=$key.GetValue($name,$null,'DoNotExpandEnvironmentNames') }
-                    }
-                }
-            })
-            @{ present=($null -ne $key); values=$values }
-        } finally { if ($key) { $key.Dispose() } }
-    }
-    PutText (SeedProtocolBackup $stageExe) (@{ keys=@($keys) } | ConvertTo-Json -Depth 8 -Compress)
 }
 function RestoreSeedProtocol($finishedExe) {
     $user = [Microsoft.Win32.Registry]::CurrentUser
@@ -213,13 +207,17 @@ function OtherDesktopRunning {
     return $false
 }
 function WaitForDesktop($path,[switch]$seed) {
-    $started=Start-Process -FilePath $path -WorkingDirectory (Split-Path $path) -PassThru
+    $info=[Diagnostics.ProcessStartInfo]::new($path)
+    $info.WorkingDirectory=Split-Path $path
+    $info.UseShellExecute=$false
+    $started=[Diagnostics.Process]::Start($info)
     $clock=[Diagnostics.Stopwatch]::StartNew()
     try {
         do {
             $apps=@(RunningApp $path)
-            $window=@($apps | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Responding }).Count -gt 0
-            if ($window -and (!$seed -or (RuntimeReady))) {return}
+            $window=$apps | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Responding } | Select-Object -First 1
+            if ($window -and !$seed) { return $window.Id }
+            if ($window -and (RuntimeReady)) { return }
             if ($started.HasExited -and !$apps.Count) {throw 'Desktop exited'}
             Start-Sleep -Milliseconds 300
         } while ($clock.Elapsed.TotalSeconds -lt $(if ($seed) {300} else {40}))
@@ -244,7 +242,7 @@ function CompleteSelection($item) {
         WaitForDesktop $exe -seed
         if (!(RuntimeReady)) {throw 'Code unavailable'}
         $script:failure=27
-        if ($item.from -and $item.from -ne $item.to) {SyncShared 'prepare'}
+        if ($item.from -and $item.from -ne $item.to) {SyncForDesktop 'prepare'}
         PutText $selection $item.to
         [IO.File]::Delete($journal)
     } catch {
@@ -252,7 +250,8 @@ function CompleteSelection($item) {
             SelectDesktop $item.from
             if (!(RuntimeReady)) {WaitForDesktop $exe -seed}
             if (!(RuntimeReady)) {exit 33}
-            SyncShared 'prepare'
+            SyncForDesktop 'prepare'
+            PutText $selection $item.from
             [IO.File]::Delete($journal)
             exit 35
         }
@@ -261,7 +260,7 @@ function CompleteSelection($item) {
 }
 try {
     $syncOnly=$action -in @('models','skills','connections','capabilities')
-    if ($syncOnly -and ![IO.File]::Exists($record)) {exit 0}
+    if ($syncOnly -and ![IO.File]::Exists($record)) {exit 28}
     foreach ($path in 'HKLM:\SOFTWARE\Policies\Claude','HKCU:\SOFTWARE\Policies\Claude') {
         $policy=Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
         if ($policy -and @($policy.GetValueNames() -match '^(inference|bootstrap|deploymentMode)').Count) {exit 20}
@@ -269,24 +268,43 @@ try {
     $ours=SelectedProfileMatches
     if (!$ours -and (Test-Path -LiteralPath $library) -and @(Get-ChildItem -LiteralPath $library -File).Count) {exit 20}
     $active=if ([IO.File]::Exists($selection)) {[IO.File]::ReadAllText($selection)}
-    $installed=$active -and [IO.File]::Exists((Join-Path $machineRoot ($active+'\release.json'))) -and $active -cmatch '^\d+\.\d+\.\d+\.0$'
+    $installed=$active -cmatch '^\d+\.\d+\.\d+\.0$' -and [IO.File]::Exists((Join-Path $machineRoot ($active+'\release.json')))
     if ($installed) {SelectDesktop $active}
     $prev=ReadJson $record
     $same=$ours -and $prev.identity -ceq $env:CAM_CLAUDE_ID -and $prev.pipe -ceq $env:CAM_CLAUDE_PIPE -and (ProfileReady) -and [IO.File]::Exists($helper)
     $ready=$installed -and $same -and (RuntimeReady)
     $pending=ReadJson $journal
+    $bindingStamp=$env:CAM_CLAUDE_ID+'|'+$env:CAM_CLAUDE_PIPE
+    $sharedStamp=try { if ([IO.File]::Exists($sharedReady)) {[IO.File]::ReadAllText($sharedReady)} } catch { $null }
+    $legacyModels=$same -and $sharedStamp -ceq $bindingStamp
+    $legacyConnections=$same -and $sharedStamp -ceq ($bindingStamp+'|shared-v3')
+    $legacyShared=$legacyConnections -or $legacyModels -or ($same -and $sharedStamp -ceq ($bindingStamp+'|models-v2'))
     if ($action -ceq 'status') {
         if ($pending) {exit 14}
         if (!$installed) {exit 10}
-        if ($ready -and [IO.File]::Exists($sharedReady) -and [IO.File]::ReadAllText($sharedReady) -ceq ($env:CAM_CLAUDE_ID+'|'+$env:CAM_CLAUDE_PIPE)) {exit 12}
+        if ($ready -and $sharedStamp -ceq ($bindingStamp+'|shared-v4')) {exit 12}
+        if ($ready) {exit 15}
         exit 11
     }
-    if ($syncOnly) {if (!$same) {exit 0}; if ($pending -or !$ready) {exit 28}; SyncShared $action; exit 0}
+    if ($syncOnly) {if (!$same -or $pending -or !$ready) {exit 28}; SyncShared $action; exit 0}
     if ($action -ceq 'open') {
         if ($pending -or !$ready) {exit 28}
         RestoreSeedProtocol
         if (!(RunningApp $exe) -and (OtherDesktopRunning)) {exit 21}
-        $failure=26; WaitForDesktop $exe; exit 0
+        if ($legacyShared) {
+            if ($env:CAM_CLAUDE_PREPARE_PART -cne 'upgrade-shared') {exit 48}
+            if ($legacyModels) {
+                if (!$connection) {exit 29}
+                $failure=29; ConfigureDesktopProvider
+            }
+            if ($legacyConnections) {
+                try {
+                    SyncShared 'connections'
+                    PutText $sharedReady ($bindingStamp+'|shared-v4')
+                } catch { Write-Verbose "Claude connections need repair." }
+            } else { SyncForDesktop 'prepare' }
+        }
+        $failure=26; $windowPid=WaitForDesktop $exe; exit (0x40000000 -bor [int]$windowPid)
     }
     if ($action -ceq 'update') {
         if (!$installed -or !$same) {exit 28}
@@ -306,7 +324,7 @@ try {
         if (![IO.File]::Exists($selection)) {exit 28}
         SelectDesktop ([IO.File]::ReadAllText($selection))
         if (!(RuntimeReady)) {if (OtherDesktopRunning) {exit 21}; WaitForDesktop $exe -seed}
-        SyncShared 'prepare'; exit 0
+        SyncForDesktop 'prepare'; exit 0
     }
     if (!$connection) {exit 27}
     if ((!$ready -or $pending) -and (OtherDesktopRunning)) {exit 21}
@@ -325,6 +343,8 @@ try {
         $sealed=ConvertFrom-SecureString (ConvertTo-SecureString $connection -AsPlainText -Force)
         $failure=29; ConfigureDesktopProvider; $failure=27
         PutText $record (@{identity=$env:CAM_CLAUDE_ID;pipe=$env:CAM_CLAUDE_PIPE;credential=$sealed}|ConvertTo-Json -Compress)
+    } elseif ($legacyModels) {
+        $failure=29; ConfigureDesktopProvider; $failure=27
     }
     # Existing MSIX users may have a helper that only recognizes WindowsApps.
     if (![IO.File]::Exists($helper) -or [IO.File]::ReadAllText($helper) -cne $env:CAM_CLAUDE_HELPER_BODY) {PutText $helper $env:CAM_CLAUDE_HELPER_BODY}

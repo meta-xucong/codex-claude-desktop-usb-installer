@@ -1691,7 +1691,7 @@ fn check_tree(path: &Path) -> Result<(), String> {
     }
 }
 
-fn remove_tree_no_follow(path: &Path) -> Result<(), String> {
+pub(super) fn remove_tree_no_follow(path: &Path) -> Result<(), String> {
     let Some(metadata) = metadata_optional(path)? else {
         return Ok(());
     };
@@ -1744,7 +1744,7 @@ fn clean_targets_with_recheck(
     for (index, target) in targets.iter().enumerate() {
         if let Err(error) = verify_absent(target) {
             results[index].status = "failed".into();
-            results[index].detail = format!("最终复核未通过：{error}");
+            results[index].detail = format!("{}；最终复核未通过：{error}", results[index].detail);
         }
     }
     results
@@ -3947,6 +3947,33 @@ mod tests {
         fn drop(&mut self) {
             let _ = remove_tree_no_follow(&self.0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn profile_cleanup_recovers_readonly_file_and_identifies_locked_child() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = TempRoot::new();
+        let profile = temp.0.join("usb-codex-home");
+        let cache = profile.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let sibling = temp.0.join("unrelated.txt");
+        fs::write(&sibling, b"keep").unwrap();
+        let leaf = cache.join("fixture.bin");
+        fs::write(&leaf, b"fixture").unwrap();
+        let mut attributes = fs::metadata(&leaf).unwrap().permissions();
+        attributes.set_readonly(true);
+        fs::set_permissions(&leaf, attributes).unwrap();
+
+        let holder = fs::OpenOptions::new().read(true).share_mode(1).open(&leaf).unwrap();
+        let error = remove_tree_no_follow(&profile).unwrap_err();
+        assert!(error.contains("fixture.bin"), "{error}");
+        assert!(leaf.is_file());
+        drop(holder);
+        remove_tree_no_follow(&profile).unwrap();
+        assert!(!profile.exists());
+        remove_tree_no_follow(&profile).unwrap();
+        assert_eq!(fs::read(&sibling).unwrap(), b"keep");
     }
 
     #[cfg(windows)]

@@ -3,19 +3,26 @@ import { managerApi } from "../../services/managerApi";
 import { FailureBanner } from "../components";
 import { resolveFailure, type FailureSurface } from "../errorCopy";
 import { useI18n } from "../i18n";
+import claudeMark from "../claude-mark.svg";
 import { Icon } from "../icons";
 
 type LocalState = Awaited<ReturnType<typeof managerApi.usbClaudeStatus>>;
 
-export function ClaudeDesktopAction({ disabled, busy, observing, progress, onBusy }: {
+export const canOpenClaude = (state: LocalState | null): state is "ready" | "components-pending" => state === "ready" || state === "components-pending";
+
+export function ClaudeDesktopAction({ disabled, busy, observing, updating, launchOnly, progress, onBusy, onState }: {
+  launchOnly: boolean;
   disabled: boolean;
   busy: boolean;
   observing: boolean;
+  updating?: boolean;
   progress: string | null;
+  onState: (value: LocalState | null) => void;
   onBusy: (value: boolean) => void;
 }) {
   const { t } = useI18n();
   const [state, setState] = useState<LocalState | null>(null);
+  useEffect(() => { onState(state); return () => onState(null); }, [state, onState]);
   const [failure, setFailure] = useState<FailureSurface | null>(null);
   const generation = useRef(0);
   const pending = useRef(false);
@@ -44,30 +51,34 @@ export function ClaudeDesktopAction({ disabled, busy, observing, progress, onBus
     let opening = false;
     try {
       const current = state ?? await managerApi.usbClaudeStatus();
-      opening = current === "ready";
-      if (current === "ready") await managerApi.usbClaudeOpen();
-      else await managerApi.usbClaudePrepare();
-      if (id === generation.current) setState("ready");
+      opening = canOpenClaude(current);
+      if (opening) await managerApi.usbClaudeOpen();
+      else if (!launchOnly) await managerApi.usbClaudePrepare();
+      else return;
+      if (id === generation.current && current !== "ready") {
+        const next = await managerApi.usbClaudeStatus();
+        if (id === generation.current) setState(next);
+      }
     } catch (cause) {
       if (id === generation.current) {
         setState(null);
         setFailure(resolveFailure(cause, t));
-        if (opening) {
-          const latest = await managerApi.usbClaudeStatus().catch(() => null);
-          if (id === generation.current) setState(latest);
-        }
+        const latest = await managerApi.usbClaudeStatus().catch(() => null);
+        if (id === generation.current && (opening || canOpenClaude(latest))) setState(latest);
       }
     } finally {
       pending.current = false;
       onBusy(false);
     }
   }
-  const label = observing ? "claude.working" : busy ? (state === "ready" ? "claude.opening" : "claude.working")
-    : state ? `claude.${state}` as const : failure ? "claude.retry" : "claude.check";
+  const launchable = canOpenClaude(state);
+  if (launchOnly && !launchable) return null;
+  const label = updating ? "dual.updatingClaude" : observing ? "claude.working" : busy ? (launchable ? "claude.opening" : "claude.working")
+    : launchable ? "claude.ready" : state ? `claude.${state}` as const : failure ? "claude.retry" : "claude.check";
   return <>
-    <button className={state === "ready" ? "btn big claude-launch" : "btn ghost"} onClick={() => void open()}
+    <button className={launchable ? "btn big claude-launch" : "btn ghost"} onClick={() => void open()}
       disabled={disabled || busy || (!state && !failure)}>
-      {state === "ready" && <Icon name={busy ? "loader" : "play"} className={busy ? "spinicon" : undefined} />}
+      {launchable && (busy ? <Icon name="loader" className="spinicon" /> : <img src={claudeMark} width="18" height="18" alt="" />)}
       {t(label)}
     </button>
     {progress && <div className="sub progress-activity" role="status">{progress}</div>}

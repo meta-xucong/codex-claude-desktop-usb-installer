@@ -2224,6 +2224,10 @@ button.themecard-art:focus-visible {
   line-height: 1.45;
 }
 .component-service-list {
+  border: 0;
+  min-width: 0;
+  padding: 0;
+  margin: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;

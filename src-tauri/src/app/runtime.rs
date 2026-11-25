@@ -135,6 +135,25 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+pub(super) fn windows_powershell() -> Result<PathBuf, AppError> {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+        let mut dir = [0u16; 32768];
+        let len = unsafe { GetSystemDirectoryW(dir.as_mut_ptr(), dir.len() as u32) } as usize;
+        if len == 0 || len >= dir.len() {
+            return Err(AppError::Engine("未找到 Windows 系统目录。".into()));
+        }
+        Ok(PathBuf::from(OsString::from_wide(&dir[..len]))
+            .join(r"WindowsPowerShell\v1.0\powershell.exe"))
+    }
+    #[cfg(not(windows))]
+    Err(AppError::UnsupportedPlatform)
+}
+
 #[cfg(target_os = "windows")]
 fn library_loadable(name: &str) -> bool {
     use windows_sys::Win32::Foundation::FreeLibrary;

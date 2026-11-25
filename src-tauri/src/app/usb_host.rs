@@ -148,10 +148,25 @@ pub(crate) fn account_state(
 }
 
 pub fn status() -> Result<UsbHostStatus, AppError> {
-    host_status(None, true)
+    status_for_view(false)
 }
 
-fn host_status(config: Option<&Value>, probe_media: bool) -> Result<UsbHostStatus, AppError> {
+fn check_host_media(home: &Path, overview: bool, live_probe: impl FnOnce() -> Result<(), AppError>) -> Result<(), AppError> {
+    if overview {
+        let (credential, connection) = super::media_generation::connection_paths_in(home);
+        if !credential.is_file() || !connection.is_file() {
+            return Err(AppError::Engine("媒体 MCP 授权文件未完整写入本机".into()));
+        }
+    } else {
+        live_probe()?;
+    }
+    if capability_pack::read_media_authorization_status(home) != "verified" {
+        return Err(AppError::Engine("媒体 MCP 本机授权状态尚未确认，请修复组件".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn status_for_view(overview: bool) -> Result<UsbHostStatus, AppError> {
     if !usb_guard::guard_required() {
         return Ok(UsbHostStatus {
             required: false,
@@ -162,35 +177,22 @@ fn host_status(config: Option<&Value>, probe_media: bool) -> Result<UsbHostStatu
             message: String::new(),
         });
     }
-    let binding = usb_guard::authorized_account_binding()?
-        .ok_or_else(|| AppError::Engine("未取得当前 U 盘账号绑定".into()))?;
     let home = usb_guard::local_data_paths()?.codex_home;
-    if binding.ccswitch.provider_id != readback::USB_404TOKEN_PROVIDER_ID {
-        return Err(AppError::Engine("当前 U 盘账号类型不支持本机初始化".into()));
-    }
-    let disk_config;
-    let config = match config {
-        Some(config) => config,
-        None => { disk_config = read_config(&home)?; &disk_config }
-    };
-    let auth = read_optional(&home.join("auth.json"))?
-        .map(|bytes| serde_json::from_slice::<Json>(&bytes).map_err(|_| invalid_config()))
-        .transpose()?;
-    let account = account_state(config, auth.as_ref(), &binding.ccswitch.device_api_key)?;
+    let config = read_config(&home)?;
+    let account = bound_account_state(&home, &config)?;
     let media_disabled = config
         .get("mcp_servers")
         .and_then(|v| v.get("media_generation"))
         .and_then(|v| v.get("enabled"))
         .and_then(Value::as_bool)
         == Some(false);
-    let core_ready = capability_pack::host_core_ready(&home, config)?;
-    let media_error = if probe_media && core_ready && !media_disabled {
-        match crate::app::media_generation::verify_authorized_local_connection() {
-            Err(error) => Some(error.to_string()),
-            Ok(()) if capability_pack::read_media_authorization_status(&home) != "verified" =>
-                Some("媒体 MCP 本机授权状态尚未确认，启动时将重新初始化".into()),
-            Ok(()) => None,
-        }
+    let core = capability_pack::host_core_ready(&home, &config);
+    let core_ready = matches!(core, Ok(true));
+    let media_error = if let Err(error) = core {
+        Some(error.to_string())
+    } else if core_ready && !media_disabled {
+        check_host_media(&home, overview, super::media_generation::verify_authorized_local_connection)
+            .err().map(|error| error.to_string())
     } else { None };
     let capabilities_ready = core_ready && media_error.is_none();
     let account_ready = account == AccountState::Ready;
@@ -203,12 +205,34 @@ fn host_status(config: Option<&Value>, probe_media: bool) -> Result<UsbHostStatu
         else { media_error.as_deref().unwrap_or("程序已安装，本机核心能力尚未准备完成") }.into() })
 }
 
-pub fn ensure_ready() -> Result<(), AppError> {
-    ensure_ready_for_open(None, true)
+pub(crate) fn bound_account_state(home: &Path, config: &Value) -> Result<AccountState, AppError> {
+    let binding = usb_guard::authorized_account_binding()?
+        .ok_or_else(|| AppError::Engine("未取得当前 U 盘账号绑定".into()))?;
+    if binding.ccswitch.provider_id != readback::USB_404TOKEN_PROVIDER_ID {
+        return Err(AppError::Engine("当前 U 盘账号类型不支持本机初始化".into()));
+    }
+    account_in_home(home, config, &binding.ccswitch.device_api_key)
 }
 
-pub(crate) fn ensure_ready_for_open(config: Option<&Value>, probe_media: bool) -> Result<(), AppError> {
-    let state = host_status(config, probe_media)?;
+fn account_in_home(home: &Path, config: &Value, key: &str) -> Result<AccountState, AppError> {
+    let auth = read_optional(&home.join("auth.json"))?
+        .map(|bytes| serde_json::from_slice::<Json>(&bytes).map_err(|_| invalid_config()))
+        .transpose()?;
+    account_state(config, auth.as_ref(), key)
+}
+
+pub(crate) fn ensure_account_for_open(config: &Value) -> Result<(), AppError> {
+    if !usb_guard::guard_required() { return Ok(()); }
+    let home = usb_guard::local_data_paths()?.codex_home;
+    match bound_account_state(&home, config)? {
+        AccountState::Ready => Ok(()),
+        AccountState::Missing | AccountState::Conflict => Err(AppError::UsbHostNotReady(
+            "请先使用当前 U 盘账号完成本机初始化。".into())),
+    }
+}
+
+pub fn ensure_ready() -> Result<(), AppError> {
+    let state = status()?;
     if state.ready {
         Ok(())
     } else {
@@ -224,14 +248,40 @@ pub(crate) fn complete_initialization(
 ) -> Result<(), AppError> {
     let capability_result = capabilities();
     let account_result = account();
-    let errors: Vec<String> = [capability_result, account_result].into_iter()
-        .filter_map(Result::err).map(|error| error.to_string()).collect();
-    if errors.is_empty() { Ok(()) } else { Err(AppError::Engine(errors.join("\n"))) }
+    match (capability_result, account_result) {
+        (Err(first), Err(second)) => Err(AppError::Engine(format!("{first}\n{second}"))),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn homepage_uses_local_media_evidence_while_full_status_calls_the_probe() {
+        let home = std::env::temp_dir().join(format!("host-media-{}", uuid::Uuid::new_v4()));
+        let (credential, connection) = super::super::media_generation::connection_paths_in(&home);
+        let directory = connection.parent().unwrap();
+        fs::create_dir_all(directory).unwrap();
+        let no_probe = || -> Result<(), AppError> { panic!("unexpected live probe on homepage") };
+        assert!(check_host_media(&home, true, no_probe).is_err());
+        fs::write(&credential, b"fixture").unwrap();
+        fs::write(&connection, b"{}").unwrap();
+        assert!(check_host_media(&home, true, no_probe).is_err());
+        fs::write(directory.join("media-generation.authorization.json"),
+            br#"{"schemaVersion":1,"packId":"codex-starter","status":"verified"}"#).unwrap();
+        assert!(check_host_media(&home, true, no_probe).is_ok());
+        let calls = std::cell::Cell::new(0);
+        check_host_media(&home, false, || { calls.set(calls.get() + 1); Ok(()) }).unwrap();
+        assert_eq!(calls.get(), 1);
+        let error = check_host_media(&home, false, || Err(AppError::Engine("fixture live probe failure".into()))).unwrap_err();
+        assert!(error.to_string().contains("fixture live probe failure"));
+        fs::remove_file(credential).unwrap();
+        assert!(check_host_media(&home, true, no_probe).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn independent_account_setup_runs_after_capability_failure_and_retains_both_errors() {
         let called = std::cell::Cell::new(false);
@@ -245,7 +295,8 @@ mod tests {
     }
     #[test]
     fn independent_initialization_does_not_hide_a_partial_failure() {
-        assert!(complete_initialization(|| Err(AppError::Engine("fixture".into())), || Ok(())).is_err());
+        assert!(matches!(complete_initialization(|| Err(AppError::Engine("fixture".into())), || Ok(())),
+            Err(AppError::Engine(message)) if message == "fixture"));
         assert!(complete_initialization(|| Ok(()), || Ok(())).is_ok());
     }
     #[test]
@@ -272,6 +323,21 @@ requires_openai_auth = true
 "#
         .parse()
         .unwrap()
+    }
+    #[test]
+    fn open_account_readback_is_independent_of_failed_components_and_checks_the_current_key() {
+        let home = std::env::temp_dir().join(format!("usb-open-account-{}", uuid::Uuid::new_v4()));
+        let kit = home.join("codex-agent-kit");
+        fs::create_dir_all(&kit).unwrap();
+        fs::write(home.join("config.toml"), toml::to_string(&config()).unwrap()).unwrap();
+        fs::write(home.join("auth.json"), br#"{"OPENAI_API_KEY":"fixture"}"#).unwrap();
+        fs::write(kit.join("readiness.json"), b"{").unwrap();
+        let settings = read_config(&home).unwrap();
+        assert_eq!(account_in_home(&home, &settings, "fixture").unwrap(), AccountState::Ready);
+        assert_eq!(account_in_home(&home, &settings, "another-drive").unwrap(), AccountState::Conflict);
+        fs::remove_file(home.join("auth.json")).unwrap();
+        assert_eq!(account_in_home(&home, &settings, "fixture").unwrap(), AccountState::Missing);
+        fs::remove_dir_all(&home).unwrap();
     }
     #[test]
     fn empty_host_is_missing_not_ready_or_conflict() {

@@ -454,6 +454,7 @@ pub enum Decision {
 pub struct LocalSnapshot {
     pub policy: RegistrationPolicy,
     pub decision: Option<Decision>,
+    pub has_verified_host_receipt: bool,
     pub had_verified_revoked_history: bool,
     pub highest_verified_revoked_version: Option<u64>,
 }
@@ -724,6 +725,7 @@ pub fn local_snapshot(
         return Ok(LocalSnapshot {
             policy,
             decision: Some(Decision::LegacyUnenrolled),
+            has_verified_host_receipt: false,
             had_verified_revoked_history: false,
             highest_verified_revoked_version: None,
         });
@@ -731,7 +733,7 @@ pub fn local_snapshot(
 
     let signature_digest = license_signature_sha256(license).map_err(|error| error.to_string())?;
     let fingerprint_sha = fingerprint_digest(fingerprint).map_err(|error| error.to_string())?;
-    let previous = read_merged_state(
+    let (previous, has_verified_host_receipt) = read_merged_state_with_origin(
         &root.join(STATE_DIR_NAME).join(STATE_FILE_NAME),
         &local_state_path(&license.installation_id)?,
         license,
@@ -779,6 +781,7 @@ pub fn local_snapshot(
     Ok(LocalSnapshot {
         policy,
         decision,
+        has_verified_host_receipt,
         had_verified_revoked_history,
         highest_verified_revoked_version,
     })
@@ -1320,6 +1323,18 @@ fn read_merged_state(
     signature_digest: &str,
     fingerprint_sha: &str,
 ) -> Result<Option<RevocationStateFile>, String> {
+    read_merged_state_with_origin(usb_path, local_path, license, signature_digest, fingerprint_sha)
+        .map(|(state, _)| state)
+}
+
+fn read_merged_state_with_origin(
+    usb_path: &Path,
+    local_path: &Path,
+    license: &UsbLicense,
+    signature_digest: &str,
+    fingerprint_sha: &str,
+) -> Result<(Option<RevocationStateFile>, bool), String> {
+    let mut has_verified_host_receipt = false;
     let mut valid = Vec::new();
     for path in [usb_path, local_path] {
         let Some(state) = read_state_file(path)? else {
@@ -1337,10 +1352,11 @@ fn read_merged_state(
         if receipts.is_empty() {
             continue;
         }
+        has_verified_host_receipt |= path == local_path;
         valid.push(RevocationStateFile { receipts, ..state });
     }
     let Some(first) = valid.first().cloned() else {
-        return Ok(None);
+        return Ok((None, false));
     };
     let mut merged = first;
     for state in valid.iter().skip(1) {
@@ -1356,7 +1372,7 @@ fn read_merged_state(
     if merged.receipts.len() > MAX_COMPACTED_RECEIPTS {
         return Err("授权状态包含过多签名回执，已停止启动".to_string());
     }
-    Ok(Some(merged))
+    Ok((Some(merged), has_verified_host_receipt))
 }
 
 fn read_state_file(path: &Path) -> Result<Option<RevocationStateFile>, String> {
@@ -2844,6 +2860,17 @@ mod tests {
             )
             .unwrap();
             drop(first_lock);
+
+            // A valid receipt on the removable volume alone does not establish
+            // that this Windows user has seen this installation before.
+            let missing_host_copy = local_base.join("another-installation.json");
+            let (usb_only, on_host) = read_merged_state_with_origin(
+                &usb_path, &missing_host_copy, &license, &signature_digest, &fingerprint_sha,
+            ).unwrap();
+            assert!(usb_only.is_some() && !on_host);
+            assert!(read_merged_state_with_origin(
+                &usb_path, &local_path, &license, &signature_digest, &fingerprint_sha,
+            ).unwrap().1);
 
             let lower_active =
                 signed_status(&signing_key, &license, &signature_digest, "active", 20);

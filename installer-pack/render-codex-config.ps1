@@ -217,7 +217,9 @@ $feishuEnvironmentNames = @('FEISHU_APP_ID', 'FEISHU_APP_SECRET')
 if ($FeishuAuthMode -eq 'tenant') { $feishuEnvironmentNames += 'CODEX_USB_FEISHU_SETUP_ENTRY' }
 if ($FeishuAuthMode -eq 'user') { $feishuEnvironmentNames += 'FEISHU_USER_ACCESS_TOKEN' }
 $renderedEnvironmentNames = '[' + (($feishuEnvironmentNames | ForEach-Object { ConvertTo-TomlString $_ }) -join ', ') + ']'
+$shellCommand = ConvertTo-TomlString (Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe')
 $replacements = @{
+    '__WINDOWS_POWERSHELL__' = $shellCommand
     '__FEISHU_ENABLED__' = $(if ($EnableFeishu) { 'true' } else { 'false' })
     '__FEISHU_WRAPPER__' = (ConvertTo-TomlString ([IO.Path]::GetFullPath($FeishuWrapperPath)))
     '__FEISHU_MCP_CACHE__' = (ConvertTo-TomlString ([IO.Path]::GetFullPath($FeishuPackageCache)))
@@ -229,6 +231,7 @@ $replacements = @{
 foreach ($key in $replacements.Keys) { $template = $template.Replace($key, [string]$replacements[$key]) }
 if ($template -match '__[A-Z0-9_]+__') { throw 'Rendered Feishu config still contains placeholders.' }
 $lines.Add($template.Trim())
+$mediaTemplate = $mediaTemplate.Replace('__WINDOWS_POWERSHELL__', $shellCommand)
 $mediaTemplate = $mediaTemplate.Replace('__MEDIA_GENERATION_ENABLED__', $(if ($EnableMediaGeneration) { 'true' } else { 'false' }))
 $mediaTemplate = $mediaTemplate.Replace('__MEDIA_GENERATION_WRAPPER__', (ConvertTo-TomlString ([IO.Path]::GetFullPath($MediaMcpWrapperPath))))
 if ($mediaTemplate -match '__[A-Z0-9_]+__') { throw 'Rendered media MCP config still contains placeholders.' }

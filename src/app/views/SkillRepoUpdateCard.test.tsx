@@ -127,7 +127,7 @@ describe("SkillRepoUpdateCard", () => {
 
   it("retries only Claude when the main skill update has already finished", async () => {
     api.skillRepoCheckUpdate.mockResolvedValue(INFO);
-    api.usbClaudeSyncSkills.mockRejectedValueOnce(new Error("sync")).mockResolvedValueOnce();
+    api.usbClaudeSyncSkills.mockRejectedValueOnce(new Error("sync")).mockResolvedValueOnce("synced");
     render(<I18nProvider><SkillRepoUpdateCard dualEdition /></I18nProvider>);
     openDetails();
     const button = screen.getByRole("button", { name: "Install / update" });

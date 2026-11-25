@@ -172,11 +172,11 @@ if ($shouldSetPreferred) {
     $modelLine = 'model = "' + [string]$catalog.preferredModel + '"'
     $policyLines = @($beginMarker, $modelLine, $endMarker)
     if ($modelLineIndex -ge 0) {
-        $prefix = if ($modelLineIndex -gt 0) { @($lines[0..($modelLineIndex - 1)]) } else { @() }
+        [string[]]$prefix = if ($modelLineIndex -gt 0) { @($lines[0..($modelLineIndex - 1)]) } else { @() }
         $suffix = if (($modelLineIndex + 1) -lt $lines.Count) { @($lines[($modelLineIndex + 1)..($lines.Count - 1)]) } else { @() }
         $lines = $prefix + $policyLines + $suffix
     } elseif ($firstTable -ge 0) {
-        $prefix = if ($firstTable -gt 0) { @($lines[0..($firstTable - 1)]) } else { @() }
+        [string[]]$prefix = if ($firstTable -gt 0) { @($lines[0..($firstTable - 1)]) } else { @() }
         $suffix = @($lines[$firstTable..($lines.Count - 1)])
         $lines = $prefix + $policyLines + @('') + $suffix
     } else {

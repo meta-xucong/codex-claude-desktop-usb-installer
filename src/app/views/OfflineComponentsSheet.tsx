@@ -62,11 +62,15 @@ function configNeedsAttention(report: CapabilityPackReport): boolean {
 export function OfflineComponentsSheet({
   open,
   onDismiss,
+  onRepaired,
   view = "connections",
+  dualEdition = false,
 }: {
   open: boolean;
   onDismiss: () => void;
+  onRepaired?: () => void;
   view?: OfflineComponentsView;
+  dualEdition?: boolean;
 }) {
   const { t } = useI18n();
   const titleId = useId();
@@ -92,6 +96,12 @@ export function OfflineComponentsSheet({
   const [otherConnectionsOpened, setOtherConnectionsOpened] = useState(false);
   const [packReport, setPackReport] = useState<CapabilityPackReport | null>(null);
   const [ccswitchReport, setCcswitchReport] = useState<CcswitchLaunchReport | null>(null);
+  const [edits, setEdits] = useState<string[]>([]);
+  const [savedDashKey, setSavedDashKey] = useState(false);
+  const [syncScope, setSyncScope] = useState<"connections" | "capabilities">("capabilities");
+  const baseline = useRef<Record<string, unknown>>({});
+  const track = (key: string, value: unknown) => setEdits(current =>
+    baseline.current[key] === value ? current.filter(k => k !== key) : [...new Set([...current, key])]);
   const statusRequestRef = useRef(0);
   const mediaCatalogRequestRef = useRef(0);
   const maintenanceSettingsRequestRef = useRef(0);
@@ -104,7 +114,11 @@ export function OfflineComponentsSheet({
       setOtherConnectionsOpened(false);
       setFeishuError(null);
       setFeishuNotice(null);
-      setForm((current) => ({ ...current, feishuAppSecret: "", feishuUserAccessToken: "" }));
+      baseline.current = {};
+      setForm(EMPTY_FORM);
+      setEdits([]);
+      setSavedDashKey(false);
+      setPackReport(null);
       return;
     }
     const requestId = statusRequestRef.current + 1;
@@ -112,9 +126,21 @@ export function OfflineComponentsSheet({
     setStatusLoading(true);
     setError(null);
     void managerApi
-      .capabilityPackStatus()
+      .capabilityPackStatus(view === "connections")
       .then((report) => {
-        if (statusRequestRef.current === requestId) setPackReport(report);
+        if (statusRequestRef.current !== requestId) return;
+        setPackReport(report);
+        const saved = report.connectionSettings;
+        if (saved) {
+          const flags = { "media-generation": saved.media, "dashscope-web-search": saved.api.includes("dashscope-web-search"),
+            cloudflare: saved.remote.includes("cloudflare"), figma: saved.remote.includes("figma"),
+            linear: saved.remote.includes("linear"), notion: saved.remote.includes("notion") };
+          const values = {dashscopeBaseUrl: saved.dashscopeBaseUrl, dashscopeModel: saved.dashscopeModel};
+          baseline.current = { ...flags, ...values, dashscopeApiKey: "" };
+          setEnabled(flags);
+          setForm(current => ({ ...current, ...values }));
+          setSavedDashKey(saved.dashscopeConfigured);
+        }
       })
       .catch((cause) => {
         if (statusRequestRef.current === requestId) setError(errorMessage(cause));
@@ -125,7 +151,7 @@ export function OfflineComponentsSheet({
     return () => {
       if (statusRequestRef.current === requestId) statusRequestRef.current += 1;
     };
-  }, [open]);
+  }, [open, view]);
 
   const refreshMediaModels = useCallback(async () => {
     const requestId = mediaCatalogRequestRef.current + 1;
@@ -241,6 +267,7 @@ export function OfflineComponentsSheet({
   }, [open, view, otherConnectionsOpened, mediaGenerationEnabled, refreshMediaModels]);
 
   const update = <K extends keyof FormValues>(key: K, value: FormValues[K]) => {
+    if (!key.startsWith("feishu")) track(key, value);
     setForm((current) => ({ ...current, [key]: value }));
     if (key.startsWith("feishu")) {
       setFeishuError(null);
@@ -251,6 +278,7 @@ export function OfflineComponentsSheet({
   };
 
   const toggleService = (service: ServiceId) => {
+    track(service, !enabled[service]);
     setEnabled((current) => ({ ...current, [service]: !current[service] }));
     setError(null);
   };
@@ -269,7 +297,7 @@ export function OfflineComponentsSheet({
     }
     if (
       enabled["dashscope-web-search"] &&
-      (!form.dashscopeApiKey.trim() || !form.dashscopeBaseUrl.trim() || !form.dashscopeModel.trim())
+      ((!savedDashKey && !form.dashscopeApiKey.trim()) || !form.dashscopeBaseUrl.trim() || !form.dashscopeModel.trim())
     ) {
       return t("offline.components.validationDashscope");
     }
@@ -297,6 +325,7 @@ export function OfflineComponentsSheet({
     try {
       const report = await managerApi.installCapabilityPack({
         ...form,
+        connectionEdits: view === "connections" ? edits : undefined,
         // Maintenance repairs the pack, not user connections. Keep the saved
         // media route fields in the request for config rendering, while
         // explicitly preventing credential persistence/clearing.
@@ -309,9 +338,17 @@ export function OfflineComponentsSheet({
         enableMediaGeneration: enabled["media-generation"],
         enabledApiServices: API_SERVICE_KEYS.filter((service) => enabled[service]),
         enabledRemoteMcps: REMOTE_MCP_KEYS.filter((server) => enabled[server]),
-      });
+      }, view === "maintenance");
       setPackReport(report);
-      if (!report.coreReady) setError(report.message);
+      if (view === "maintenance" && report.success && report.coreReady) onRepaired?.();
+      setSyncScope(view === "connections" ? "connections" : "capabilities");
+      if (report.installed && !CONFIG_ATTENTION_STATUSES.has(report.configStatus)) {
+        baseline.current = { ...baseline.current, ...enabled, ...form, dashscopeApiKey: "" };
+        if (form.dashscopeApiKey.trim()) setSavedDashKey(true);
+        setForm(current => ({ ...current, dashscopeApiKey: "" }));
+        setEdits([]);
+      }
+      if (!report.coreReady || CONFIG_ATTENTION_STATUSES.has(report.configStatus)) setError(report.message);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -349,6 +386,7 @@ export function OfflineComponentsSheet({
         enableMediaGeneration: true,
       });
       setPackReport(report);
+      setSyncScope("connections");
       if (report.feishuEnabled !== enable || (enable && (!report.feishuConfigured || report.feishuRuntimeStatus !== "passed"))) {
         setFeishuError(t("offline.components.feishuApplyFailed"));
         return;
@@ -462,6 +500,17 @@ export function OfflineComponentsSheet({
             </button>
           ) : null}
         </div>
+        {dualEdition && view === "connections" && <p className="component-note">{t("dual.sharedTools")}</p>}
+        {dualEdition && packReport?.claudeSync && <p role="status">
+          {t(packReport.claudeSync === "failed" ? "dual.syncFailed" : packReport.claudeSync === "pending" ? "dual.syncWaiting" : "dual.syncDone")}
+          {packReport.claudeSync === "failed" && <button className="btn ghost" disabled={busy !== null} onClick={async () => {
+            setBusy("pack");
+            try {
+              const result = await managerApi.usbClaudeSyncSkills(syncScope);
+              setPackReport(current => current && ({ ...current, claudeSync: result === "not_applicable" ? undefined : result }));
+            } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(null); }
+          }}>{t("dual.retrySync")}</button>}
+        </p>}
         <span id={bodyId} className="sr-only">
           {t(view === "connections" ? "offline.components.feishuPrivacy" : "offline.components.maintenanceBody")}
         </span>
@@ -519,7 +568,7 @@ export function OfflineComponentsSheet({
             onToggle={(event) => { if (event.currentTarget.open) setOtherConnectionsOpened(true); }}>
           <summary>{t("offline.components.otherConnections")}</summary>
           {otherConnectionsOpened ? (
-          <div className="component-service-list">
+          <fieldset className="component-service-list" disabled={statusLoading}>
           <section className="component-service">
             <div className="component-service-toggle">
               <input
@@ -626,7 +675,7 @@ export function OfflineComponentsSheet({
             </div>
             {enabled["dashscope-web-search"] ? (
               <div className="component-fields">
-                {field("dashscopeApiKey", t("offline.components.apiKey"), true)}
+                {field("dashscopeApiKey", t("offline.components.apiKey"), true, savedDashKey ? t("dual.savedSecret") : undefined)}
                 {field("dashscopeBaseUrl", t("offline.components.baseUrl"))}
                 {field("dashscopeModel", t("offline.components.model"))}
               </div>
@@ -639,11 +688,11 @@ export function OfflineComponentsSheet({
               className="btn ghost"
               type="button"
               onClick={() => void installPack()}
-              disabled={busy !== null || statusLoading || (mediaGenerationEnabled && mediaCatalogLoading)}
+              disabled={busy !== null || statusLoading || edits.length === 0 || (mediaGenerationEnabled && mediaCatalogLoading)}
             >
               {t(busy === "pack" ? "offline.components.installing" : "offline.components.apply")}
             </button>
-          </div>
+          </fieldset>
           ) : null}
           </details>
           </>

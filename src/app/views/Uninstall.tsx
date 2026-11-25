@@ -104,6 +104,7 @@ export function Uninstall({
   const [sharedCleanupDeferred, setSharedCleanupDeferred] = useState(false);
   const [cleanupHandoffId, setCleanupHandoffId] = useState<string | null>(null);
   const [handoffBusy, setHandoffBusy] = useState(false);
+  const [profileRetryId, setProfileRetryId] = useState<string | null>(null);
   const [needsFinalCleanup, setNeedsFinalCleanup] = useState(false);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
@@ -150,6 +151,12 @@ export function Uninstall({
     let active = true;
     void managerApi.getUninstallHandoff().then((handoff) => {
       if (!active || !handoff) return;
+      if (handoff.profileRetry) {
+        setProfileRetryId(handoff.id);
+        setDone(t("uninstall.partial.summary"));
+        setDoneDetail(handoff.message);
+        return;
+      }
       setCleanupPending(true);
       setCleanupHandoffId(handoff.id);
       setDone(t("uninstall.bundle.exiting"));
@@ -170,6 +177,7 @@ export function Uninstall({
     setError(null);
     setErrorDetail(null);
     setPartialOutcome(null);
+    setProfileRetryId(null);
     setNeedsFinalCleanup(false);
     setDoneDetail(null);
     setCleanupPending(false);
@@ -183,7 +191,9 @@ export function Uninstall({
         const r = bundledWindows
           ? await managerApi.winUninstallBundle(true, true, true, true)
           : await managerApi.winUninstall(true, true);
-        if (!r.success || !r.outcome.primaryOk) {
+        const profilePurgePending = r.outcome.appState === "absent"
+          && r.outcome.recoveryActions.includes("purge_user_data");
+        if (!r.outcome.primaryOk || (!r.success && !profilePurgePending)) {
           setError(t("uninstall.failed"));
           setErrorDetail([
             r.message, ...(r.notes ?? []), r.outcome.cleanup.detail, r.outcome.provenance.detail,
@@ -208,10 +218,12 @@ export function Uninstall({
           return;
         }
         if (outcomeNeedsAttention(r.outcome)) {
-          setNeedsFinalCleanup(bundledWindows);
+          setNeedsFinalCleanup(bundledWindows && !profilePurgePending);
+          setProfileRetryId("profileRetryId" in r ? r.profileRetryId ?? null : null);
           setPartialOutcome(r.outcome);
           setDone(t("uninstall.partial.summary"));
-          setDoneDetail(r.message);
+          const detail = r.outcome.cleanup.detail;
+          setDoneDetail(detail && !r.message.includes(detail) ? `${r.message}\n${detail}` : r.message);
           return;
         }
         if ("cleanupDeferred" in r && r.cleanupDeferred) {
@@ -250,6 +262,17 @@ export function Uninstall({
     setError(null);
     setErrorDetail(null);
     try {
+      if (profileRetryId && actions.includes("purge_user_data")) {
+        const handoff = await managerApi.retryUninstallProfile(profileRetryId);
+        setProfileRetryId(null);
+        setPartialOutcome(null);
+        setNeedsFinalCleanup(false);
+        setCleanupPending(true);
+        setCleanupHandoffId(handoff.id);
+        setDone(t("uninstall.bundle.exiting"));
+        setDoneDetail(`${handoff.message}\n${handoff.reportPath}`);
+        return;
+      }
       const report = await managerApi.retryAncillary({
         actions,
         path: partialOutcome?.path ?? null,
@@ -332,6 +355,20 @@ export function Uninstall({
     </>
   ) : null;
 
+  const goBack = async () => {
+    if (profileRetryId) {
+      try {
+        await managerApi.dismissUninstallProfileRetry(profileRetryId);
+      } catch (cause) {
+        const failure = resolveFailure(cause, t);
+        setError(failure.message);
+        setErrorDetail(failure.detail);
+        return;
+      }
+    }
+    onBack();
+  };
+
   const copyPath = async () => {
     try {
       await navigator.clipboard.writeText(dataPaths);
@@ -351,7 +388,7 @@ export function Uninstall({
     <div className={`pop${bundledWindows ? " uninstall-pop" : ""}`}>
       <NavBar
         title={t(bundledWindows ? "uninstall.bundle.heading" : "uninstall.heading")}
-        onBack={onBack}
+        onBack={() => void goBack()}
         disableBack={busy || retryBusy || cleanupPending || handoffBusy}
       />
       <div className="scroll view" inert={confirmStep > 0 ? true : undefined}>
@@ -359,8 +396,8 @@ export function Uninstall({
           <>
             <section className="hero" style={{ marginTop: 16 }}>
               <Ring
-                icon={cleanupPending ? "loader" : sharedCleanupDeferred || partialOutcome || needsFinalCleanup ? "alert" : "check"}
-                variant={cleanupPending || sharedCleanupDeferred || partialOutcome || needsFinalCleanup ? "amber" : "success"}
+                icon={cleanupPending ? "loader" : sharedCleanupDeferred || partialOutcome || profileRetryId || needsFinalCleanup ? "alert" : "check"}
+                variant={cleanupPending || sharedCleanupDeferred || partialOutcome || profileRetryId || needsFinalCleanup ? "amber" : "success"}
                 className="pop"
               />
               <div className="headline">
@@ -392,11 +429,11 @@ export function Uninstall({
             {sharedCleanupDeferred ? (
               <StatusBanner tone="warn">{t("uninstall.bundle.sharedCleanupDeferredNote")}</StatusBanner>
             ) : null}
-            {partialOutcome ? (
+            {partialOutcome || profileRetryId ? (
               <>
                 <StatusBanner tone="warn">{t("uninstall.partial.title")}</StatusBanner>
                 <div className="actions">
-                  {partialOutcome.recoveryActions.includes("cleanup_metadata") ? (
+                  {partialOutcome?.recoveryActions.includes("cleanup_metadata") ? (
                     <button
                       className="btn big"
                       disabled={retryBusy}
@@ -405,7 +442,7 @@ export function Uninstall({
                       {t("uninstall.partial.retryCleanup")}
                     </button>
                   ) : null}
-                  {partialOutcome.recoveryActions.includes("clear_provenance") ? (
+                  {partialOutcome?.recoveryActions.includes("clear_provenance") ? (
                     <button
                       className="btn big"
                       disabled={retryBusy}
@@ -414,7 +451,7 @@ export function Uninstall({
                       {t("uninstall.partial.retryProvenance")}
                     </button>
                   ) : null}
-                  {partialOutcome.recoveryActions.includes("purge_user_data") ? (
+                  {profileRetryId || partialOutcome?.recoveryActions.includes("purge_user_data") ? (
                     <button
                       className="btn big"
                       disabled={retryBusy}
@@ -423,7 +460,7 @@ export function Uninstall({
                       {t("uninstall.partial.retryPurge")}
                     </button>
                   ) : null}
-                  {partialOutcome.recoveryActions.includes("record_provenance") ? (
+                  {partialOutcome?.recoveryActions.includes("record_provenance") ? (
                     <button
                       className="btn big"
                       disabled={retryBusy}
@@ -442,7 +479,7 @@ export function Uninstall({
                 {t("uninstall.bundle.continueFinalCleanup")}
               </button>
             ) : null}
-            <button className="btn ghost big" onClick={onBack} disabled={busy || retryBusy || cleanupPending || handoffBusy}>
+            <button className="btn ghost big" onClick={() => void goBack()} disabled={busy || retryBusy || cleanupPending || handoffBusy}>
               {t("nav.back")}
             </button>
           </>

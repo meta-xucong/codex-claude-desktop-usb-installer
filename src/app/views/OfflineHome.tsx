@@ -32,7 +32,7 @@ import { mib } from "../format";
 import { Sheet } from "../Sheet";
 import { OfflineComponentsSheet, type OfflineComponentsView } from "./OfflineComponentsSheet";
 import { AccountCard, type AccountAuthorizationState } from "./AccountCard";
-import { ClaudeDesktopAction } from "./ClaudeDesktopAction";
+import { canOpenClaude, ClaudeDesktopAction } from "./ClaudeDesktopAction";
 import { SkillRepoUpdateCard } from "./SkillRepoUpdateCard";
 import { UpstreamModelManagerSheet } from "./UpstreamModelManagerSheet";
 import { ProgressScreen, type DualInstallStep } from "./ProgressScreen";
@@ -79,7 +79,7 @@ const CLAUDE_STAGE_KEYS = {
   desktop: "dual.stage.desktop", service: "dual.stage.service",
   account: "dual.stage.account", runtime: "dual.stage.runtime",
   register: "dual.stage.register", profile: "dual.stage.profile", seed: "dual.stage.seed",
-  skills: "dual.stage.skills", models: "dual.stage.models", connections: "dual.stage.connections",
+  skills: "dual.stage.skills", connections: "dual.stage.connections",
   finalize: "dual.stage.finalize", complete: "dual.stage.complete",
 } as const;
 const USB_GUARD_STARTUP_FAST_POLL_MS = 250;
@@ -395,6 +395,8 @@ export function OfflineHome({
   const [usbGuard, setUsbGuard] = useState<UsbGuardStatus | null>(null);
   const [hostStatus, setHostStatus] = useState<UsbHostStatus | null>(null);
   const [hostInitializing, setHostInitializing] = useState(false);
+  const [claudeSetupRevision, setClaudeSetupRevision] = useState(0);
+  const [claudeState, setClaudeState] = useState<Awaited<ReturnType<typeof managerApi.usbClaudeStatus>> | null>(null);
   const [claudeReattached, setClaudeReattached] = useState(false);
   const [usbGuardQueryFailed, setUsbGuardQueryFailed] = useState(false);
   const [failure, setFailure] = useState<FailureSurface | null>(null);
@@ -407,7 +409,12 @@ export function OfflineHome({
   const installActivity = activityKey ? t(activityKey) : null;
   const [dualStep, setDualStep] = useState<DualInstallStep>();
   const claudeProgressRevision = useRef(0);
+  const [claudeUpdateStage, setClaudeUpdateStage] = useState("");
   const showClaudeStage = useCallback((stage: string) => {
+    if (stage.startsWith("update:")) {
+      setClaudeUpdateStage(stage.slice(7));
+      return;
+    }
     if (!Object.hasOwn(CLAUDE_STAGE_KEYS, stage)) return;
     setDualStep(["desktop", "register", "service", "account", "profile"].includes(stage) ? 3 : 4);
     setInstallActivity(CLAUDE_STAGE_KEYS[stage as keyof typeof CLAUDE_STAGE_KEYS]);
@@ -426,7 +433,7 @@ export function OfflineHome({
   const [payloadUpdateProgress, setPayloadUpdateProgress] =
     useState<PayloadUpdateProgress | null>(null);
   const [busyAction, setBusyAction] = useState<
-    "install" | "update" | "launch" | "claude" | "ccswitch" | "logs" | "status" | null
+    "install" | "update" | "claudeUpdate" | "launch" | "claude" | "ccswitch" | "logs" | "status" | null
   >(null);
   const updateTitleId = useId();
   const updateBodyId = useId();
@@ -448,6 +455,7 @@ export function OfflineHome({
       // The banner still works for this session when storage is unavailable.
     }
   }, []);
+  const lastComponentWarning = useRef<string | null>(null);
   const clearHostSetupErrors = useCallback(() => {
     updateCcswitchInjectionIssue(null);
     setCapabilityInstallError(null);
@@ -637,7 +645,9 @@ export function OfflineHome({
         && (installed.appVersionUnavailable || compareVersions(installed.version, declaredVersion) === 0);
       let nextPayload: OfflinePayloadReport | null;
       try {
-        nextPayload = useManifestVersion ? null : await managerApi.offlinePayloadProbe();
+        const previewOnly = !installed && !verifyPayload && !nextStatus.recoveryPending
+          && !nextUsbGuardResult.failed && (usbGuardStartupPending(nextUsbGuard) || codexReadyOnAuthorizedUsb(nextUsbGuard));
+        nextPayload = useManifestVersion ? null : await managerApi.offlinePayloadProbe(undefined, previewOnly);
       } catch (probeError) {
         // A revoked cleanup deliberately removes the bundle MSIX. Keep the
         // manager shell available so the signed, backend-gated payload
@@ -848,9 +858,11 @@ export function OfflineHome({
             try {
               const host = await managerApi.initializeUsbHost(true);
               setHostStatus(host);
-              if (!host.ready) throw new Error(host.message);
+              if (!host.accountReady) throw new Error(host.message);
+              if (host.ready) clearHostSetupErrors();
               showClaudeStage("desktop");
               await managerApi.usbClaudePrepare();
+              setClaudeSetupRevision(value => value + 1);
             } finally {
               setHostInitializing(false);
               setInstallActivity(null);
@@ -939,6 +951,14 @@ export function OfflineHome({
       // pass. A verification failure must not claim a deleted file was kept.
       setInstallActivity("offline.installActivity.cleanup");
       await managerApi.offlinePayloadCleanup(stage.stagedPath).catch(() => undefined);
+      if (intent === "update" && programIsOnCurrentUsb(current, currentGuard)) {
+        // A desktop update replaces the program tree. The existing host status
+        // effect refreshes local readiness when the update operation finishes.
+        setStatus(installed);
+        setInstallActivity(null);
+        setPhase("installed");
+        return true;
+      }
       // Codex is now confirmed on disk. Install the complete local capability
       // pack first, then hand off to CCSwitch. Either auxiliary component is
       // best-effort: a failure never rolls back a verified Codex installation
@@ -1034,9 +1054,10 @@ export function OfflineHome({
         return null;
       });
       setHostStatus(finalHostStatus);
-      if (current.usbClaudeIncluded && intent !== "update" && finalHostStatus?.accountReady) {
+      if (dualInstall && finalHostStatus?.accountReady) {
         showClaudeStage("desktop");
         await managerApi.usbClaudePrepare();
+        setClaudeSetupRevision(value => value + 1);
       }
       // The backend returns a media-enabled install report only after its
       // registration check. An exception or unmerged config is not evidence.
@@ -1062,6 +1083,7 @@ export function OfflineHome({
       if (current.usbClaudeIncluded && intent !== "update" && !finalHostStatus?.accountReady) {
         notices.push(t("dual.accountPending"));
       }
+      const beforeComponentNotice = notices.length;
       if (capabilityPackReport?.coreReady && capabilityPackReport.success) {
         notices.push(
           t("offline.capabilityInstalled", {
@@ -1084,8 +1106,9 @@ export function OfflineHome({
           }),
         );
       } else {
-        notices.push(t("offline.capabilityFailed"));
+        if (!dualInstall || !finalHostStatus?.accountReady) notices.push(t("offline.capabilityFailed"));
       }
+      lastComponentWarning.current = capabilityPackReport?.success ? null : notices[beforeComponentNotice] ?? null;
       if (mediaRegistrationConfirmed && !mediaModelsAvailable) {
         notices.push(
           mediaCatalogStatus === "failed"
@@ -1105,7 +1128,8 @@ export function OfflineHome({
         notices.push(t("offline.ccswitchFailed"));
       }
       setNotice(notices.join(" "));
-      return finalHostStatus?.ready ?? false;
+      if (intent === "update" && !finalHostStatus?.accountReady) return "host-pending" as const;
+      return finalHostStatus?.accountReady ?? false;
     } catch (cause) {
       if (verifiedInstalled) setStatus(verifiedInstalled);
       setInstallActivity(null);
@@ -1116,9 +1140,9 @@ export function OfflineHome({
       } else if (stage && !verifiedInstalled) {
         setNotice("暂存文件已保留，便于查看日志和重试。");
       }
-      return false;
+      return intent === "update" && verifiedInstalled ? "host-pending" as const : false;
     } finally { setDualStep(undefined); }
-  }, [resetStop, showClaudeStage, t, updateCcswitchInjectionIssue]);
+  }, [clearHostSetupErrors, resetStop, showClaudeStage, t, updateCcswitchInjectionIssue]);
 
   const install = useCallback(async (intent: "install" | "repair") => {
     if (busyAction) return;
@@ -1140,19 +1164,57 @@ export function OfflineHome({
 
   const codexPayloadAvailable = !usbGuardQueryFailed && canUpdateCodexPayload(usbGuard);
   const dualEdition = status?.usbClaudeIncluded === true;
-  const finishClaudeUpdate = useCallback(async (justInstalled = false) => {
-    if (!dualEdition || usbGuard?.reinstallAllowed === true) return;
-    if (!justInstalled && (!status?.installed || !hostStatus?.accountReady)) return;
-    let outcome;
+  const [updatesOpen, setUpdatesOpen] = useState(false);
+  const [codexResult, setCodexResult] = useState<CodexPayloadCheck | null>(null);
+  type ClaudeCheck = Awaited<ReturnType<typeof managerApi.usbClaudeCheckUpdate>>;
+  const [claudeResult, setClaudeResult] = useState<ClaudeCheck | {kind: "failed"; message: string} | null>(null);
+  const [claudeUpdateFailure, setClaudeUpdateFailure] = useState<FailureSurface | null>(null);
+  const checkingGeneration = useRef(0);
+  useEffect(() => {
+    ++checkingGeneration.current;
+    setUpdatesOpen(false);
+  }, [usbGuard?.bundlePath]);
+  const checkBoth = useCallback(() => {
+    const generation = ++checkingGeneration.current;
+    setCodexResult(null);
+    setClaudeResult(null);
+    setClaudeUpdateFailure(null);
+    setUpdatesOpen(true);
+    setNotice(null);
+    setFailure(null);
+    void managerApi.checkCodexPayloadUpdate().catch((cause) => ({
+      kind: "unavailable" as const, message: resolveFailure(cause, t).message,
+    })).then(result => { if (generation === checkingGeneration.current) setCodexResult(result); });
+    void managerApi.usbClaudeCheckUpdate().catch((cause) => ({
+      kind: "failed" as const, message: resolveFailure(cause, t).message,
+    })).then(result => { if (generation === checkingGeneration.current) setClaudeResult(result); });
+  }, [t]);
+  const applyClaudeUpdate = async () => {
+    if (busyAction || claudeResult?.kind !== "available") return;
+    setBusyAction("claudeUpdate");
+    setClaudeUpdateStage("manifest");
+    setClaudeUpdateFailure(null);
+    const generation = checkingGeneration.current;
     try {
-      if (await managerApi.usbClaudeStatus() !== "ready") await managerApi.usbClaudePrepare();
-      const changed = await managerApi.usbClaudeUpdate();
-      outcome = t(changed ? "claude.updated" : "claude.current");
+      const changed = await managerApi.usbClaudeUpdate(claudeResult.expected);
+      if (generation !== checkingGeneration.current) return;
+      setClaudeResult({kind: "none"});
+      setNotice(t(changed ? "claude.updated" : "claude.current"));
     } catch (cause) {
-      outcome = t("dual.updatePending", { reason: resolveFailure(cause, t).message });
+      if (generation === checkingGeneration.current) setClaudeUpdateFailure(resolveFailure(cause, t, {sanitizeDetail: true}));
+    } finally {
+      setBusyAction(null);
     }
-    setNotice(previous => [previous, outcome].filter(Boolean).join(" "));
-  }, [dualEdition, hostStatus?.accountReady, status?.installed, usbGuard?.reinstallAllowed, t]);
+  };
+  const updateStages = {
+    manifest: "dual.updateManifest", desktop: "dual.downloadDesktop", code: "dual.downloadCode",
+    "retry-desktop": "dual.resumeDesktop", "retry-code": "dual.resumeCode",
+    verify: "dual.updateVerify", extract: "dual.updateExtract", activate: "dual.updateActivate",
+  } as const;
+  const [step, percent] = claudeUpdateStage.split(" ");
+  const updateActivity = Object.hasOwn(updateStages, step)
+    ? t(updateStages[step as keyof typeof updateStages]) + (percent === undefined ? "" : ` · ${percent}%`)
+    : t("dual.updateManifest");
 
   const checkCodexPayload = useCallback(async (allowWhileBusy = false) => {
     if (busyAction && !allowWhileBusy) return;
@@ -1160,6 +1222,7 @@ export function OfflineHome({
       setNotice(t("offline.updateRequiresSigned"));
       return;
     }
+    if (dualEdition && !usbGuard?.reinstallAllowed) { checkBoth(); return; }
     setBusyAction("update");
     setFailure(null);
     setNotice(null);
@@ -1178,7 +1241,6 @@ export function OfflineHome({
         setCodexUpdateConfirmOpen(true);
       } else if (result.kind === "none") {
         setNotice(t("offline.updateUpToDate"));
-        await finishClaudeUpdate();
       } else if (result.kind === "development") {
         setNotice(t("about.mgrDev"));
       } else {
@@ -1190,38 +1252,42 @@ export function OfflineHome({
             "network",
           ),
         );
-        await finishClaudeUpdate();
       }
     } catch (cause) {
       setFailure(resolveFailure(cause, t));
-      await finishClaudeUpdate();
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, codexPayloadAvailable, finishClaudeUpdate, t]);
+  }, [busyAction, codexPayloadAvailable, dualEdition, usbGuard?.reinstallAllowed, checkBoth, t]);
 
-  const applyCodexPayload = useCallback(async () => {
-    if (!pendingCodexUpdate || busyAction) return;
+  const applyCodexPayload = useCallback(async (candidate = pendingCodexUpdate) => {
+    if (!candidate || busyAction) return;
     setBusyAction("update");
     setFailure(null);
     setNotice(null);
     setPayloadUpdateProgress({ phase: "preparing", bytesDone: 0, bytesTotal: 0 });
     try {
-      await managerApi.applyCodexPayloadUpdate(pendingCodexUpdate);
+      await managerApi.applyCodexPayloadUpdate(candidate);
       setPayloadUpdateProgress(null);
       const nextPayload = await managerApi.offlinePayloadProbe();
       setPayload(nextPayload);
       setPendingCodexUpdate(null);
       setCodexUpdateConfirmOpen(false);
-      const installed = await performInstall(nextPayload, "update");
-      if (installed) {
-        setNotice(t("offline.updateApplied"));
-        await finishClaudeUpdate(true);
+      const deployed = await performInstall(nextPayload, "update");
+      if (deployed) {
+        if (deployed === "host-pending") {
+          setNotice(previous => [t("offline.updateHostPending"), previous].filter(Boolean).join(" "));
+        } else {
+          setNotice(t("offline.updateApplied"));
+        }
+        setCodexResult({ kind: "none" });
       } else {
         setNotice(t("offline.updatePayloadAppliedRetry"));
+        setCodexResult({kind:"unavailable",message:t("offline.updatePayloadAppliedRetry")});
       }
     } catch (cause) {
       setPayloadUpdateProgress(null);
+      if (updatesOpen) setCodexResult({kind:"unavailable", message:resolveFailure(cause,t).message});
       if (errorCode(cause) === "stale_expectation") {
         setPendingCodexUpdate(null);
         setCodexUpdateConfirmOpen(false);
@@ -1236,7 +1302,7 @@ export function OfflineHome({
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, checkCodexPayload, finishClaudeUpdate, pendingCodexUpdate, performInstall, t]);
+  }, [busyAction, checkCodexPayload, pendingCodexUpdate, performInstall, updatesOpen, t]);
 
   const retryCcswitchInjection = useCallback(async () => {
     if (busyAction) return;
@@ -1298,8 +1364,7 @@ export function OfflineHome({
         : undefined;
       try {
         await managerApi.winLaunch(codexLocale);
-        setHostStatus((current) => current?.ready ? current : null);
-        clearHostSetupErrors();
+        if (hostStatus?.ready) clearHostSetupErrors();
       } catch (cause) {
         // Only the launch gate can decide that this computer needs setup.
         if (errorCode(cause) !== "usb_host_not_ready") throw cause;
@@ -1309,8 +1374,8 @@ export function OfflineHome({
         // changes only the managed account fields and verifies the handoff.
         const initialized = await managerApi.initializeUsbHost(true);
         setHostStatus(initialized);
-        if (!initialized.ready) throw new Error(initialized.message);
-        clearHostSetupErrors();
+        if (!initialized.accountReady) throw new Error(initialized.message);
+        if (initialized.ready) clearHostSetupErrors();
         await managerApi.winLaunch(codexLocale);
       }
     } catch (cause) {
@@ -1322,7 +1387,7 @@ export function OfflineHome({
       setInstallActivity(null);
       setBusyAction(null);
     }
-  }, [busyAction, clearHostSetupErrors, lang, refreshHostStatus, t]);
+  }, [busyAction, clearHostSetupErrors, hostStatus, lang, refreshHostStatus, t]);
 
   const openLogs = useCallback(async () => {
     if (busyAction) return;
@@ -1369,17 +1434,21 @@ export function OfflineHome({
     }
   }
   useEffect(() => {
-    if (!showInstalled || phase === "installing" || busyAction || hostInitializing) return;
+    if (componentsOpen || !showInstalled || phase === "installing" || busyAction || hostInitializing) return;
     if (skipHostStatusAfterLaunch.current) {
       skipHostStatusAfterLaunch.current = false;
       return;
     }
     let active = true;
-    void managerApi.usbHostStatus().then((value) => { if (active) setHostStatus(value); })
+    void managerApi.usbHostStatus({ overview: true }).then((value) => {
+      if (!active) return;
+      setHostStatus(value);
+    })
       .catch((cause) => { if (active) { setHostStatus(null); setFailure(resolveFailure(cause, t)); } });
     return () => { active = false; };
   }, [showInstalled, phase, busyAction, componentsOpen, hostInitializing, t]);
-  const hostPending = hostStatus?.required === true && !hostStatus.ready;
+  const hostPending = hostStatus?.required === true && !hostStatus.accountReady;
+  const componentsPending = hostStatus?.accountReady && !hostStatus.capabilitiesReady || claudeState === "components-pending";
   const displayInstalled = codexReady ? installed : null;
   const startupReadinessPending =
     !usbGuardStartupFailed && (payloadLoading || phase === "loading" || usbGuardIsStarting);
@@ -1390,8 +1459,11 @@ export function OfflineHome({
     phase === "staging" ||
     phase === "installing";
   const payloadBytesDone = payloadUpdateProgress?.bytesDone ?? 0;
-  const claudeAction = dualEdition && codexReady && showInstalled && hostStatus?.accountReady && !hostInitializing
-    ? <ClaudeDesktopAction key={usbGuard?.bundlePath} observing={claudeReattached || busyAction === "update"}
+  const claudeAction = dualEdition && codexReady && !hostInitializing
+    ? <ClaudeDesktopAction onState={setClaudeState} key={[usbGuard?.bundlePath, claudeSetupRevision].join("|")}
+        launchOnly={!showInstalled || !hostStatus?.accountReady}
+        observing={claudeReattached || busyAction === "claudeUpdate" || componentsOpen}
+        updating={busyAction === "claudeUpdate"}
         disabled={disabled} busy={busyAction === "claude"}
         progress={busyAction === "claude" && dualStep && installActivity ? `${dualStep}/4 · ${installActivity}` : null}
         onBusy={(active) => {
@@ -1648,9 +1720,9 @@ export function OfflineHome({
               <Ring icon="check" variant="success" />
               <div className="headline">{hostPending
                 ? t(dualEdition ? "dual.codexPending" : "offline.host.pending")
-                : t(dualEdition ? "dual.codexInstalled" : "offline.installed")}</div>
+                : t(!dualEdition ? "offline.installed" : canOpenClaude(claudeState) ? "dual.installed" : claudeState ? "dual.claudeSetupPending" : "dual.codexInstalled")}</div>
               {hostPending ? <div className="sub" role="status">{hostStatus.message}</div> : null}
-              <div className="microcue">{payload ? <><Icon name="shield" />{t("offline.hashVerified")}</> : displayInstalled?.version}</div>
+              <div className="microcue">{payload?.hashVerified ? <><Icon name="shield" />{t("offline.hashVerified")}</> : displayInstalled?.version}</div>
             </>
           ) : usbInstallBlockedByExistingCodex(status, usbGuard) ? (
             <>
@@ -1675,7 +1747,7 @@ export function OfflineHome({
               <div className="headline">
                 {phase === "staging" || phase === "installing" ? t("offline.installing") : t("offline.ready")}
               </div>
-              <Tooltip content={t("offline.description")}>
+              <Tooltip content={t(dualEdition ? "dual.installDescription" : "offline.description")}>
                 <span className="tooltip-icon hero-info" aria-label={t("themes.details")}>
                   <Icon name="info" />
                 </span>
@@ -1766,7 +1838,7 @@ export function OfflineHome({
                   codexPayloadAvailable
                     ? usbGuard?.reinstallAllowed === true
                       ? t("offline.reactivationUpdateHint")
-                      : t("offline.updateHint")
+                      : t(dualEdition ? "dual.updateHint" : "offline.updateHint")
                     : t("offline.updateRequiresSigned")
                 }
               >
@@ -1785,11 +1857,19 @@ export function OfflineHome({
                     ? t("offline.updateChecking")
                     : usbGuard?.reinstallAllowed === true
                       ? t("offline.reactivationUpdateEntry")
-                      : t(dualEdition ? "dual.codexUpdate" : "offline.updateEntry")}
+                      : t(dualEdition ? "dual.checkUpdates" : "offline.updateEntry")}
                 </button>
               </Tooltip>
             </span>
           ) : null}
+          {!showInstalled && claudeAction}
+          {componentsPending && codexReady && <div role="status" className="sub">
+            {t("offline.components.pendingHint")}{" "}
+            <button className="btn ghost" disabled={disabled} onClick={() => {
+              setComponentsView("maintenance");
+              setComponentsOpen(true);
+            }}>{t("offline.components.repairEntry")}</button>
+          </div>}
           {!showInstalled && onOpenUninstall ? (
             <button className="btn ghost danger" onClick={onOpenUninstall} disabled={disabled}>
               <Icon name="trash" />{t("offline.uninstallBundle")}
@@ -1842,7 +1922,7 @@ export function OfflineHome({
                 <summary>{t("offline.installDetails")}</summary>
                 <div>{installationDetail}</div>
                 {capabilityInstallError ? (
-                  <div>{`能力包自动安装失败：${capabilityInstallError}\n可在“高级功能 > 组件修复”中重试。`}</div>
+                  <div>{`能力包自动安装失败：${capabilityInstallError}${dualEdition ? "" : "\n可在“高级功能 > 组件修复”中重试。"}`}</div>
                 ) : null}
               </details>
             ) : null}
@@ -1874,6 +1954,33 @@ export function OfflineHome({
         ) : null}
       </div>
       <Sheet
+        open={updatesOpen}
+        onDismiss={() => { if (!busyAction) setUpdatesOpen(false); }}
+        dismissable={!busyAction} labelledBy={updateTitleId + "-dual"} initialFocus="dismiss"
+      >
+        <h3 id={updateTitleId + "-dual"}>{t("dual.checkUpdates")}</h3>
+        <div className="list">
+          <div className="row"><div className="rtext"><strong>Codex</strong>
+            <div className="sub" role="status">{!codexResult ? t("offline.updateChecking") :
+              codexResult.kind === "available" ? codexResult.info.currentVersion + " → " + codexResult.info.latestVersion :
+              codexResult.kind === "unavailable" ? codexResult.message || t("offline.updateUnavailable") :
+              t(codexResult.kind === "none" ? "offline.updateUpToDate" : "about.mgrDev")}</div></div>
+            {codexResult?.kind === "available" && <button className="btn primary" disabled={!!busyAction}
+              onClick={() => void applyCodexPayload(codexResult.info)}>{t("dual.updateOnlyCodex")}</button>}
+          </div>
+          <div className="row"><div className="rtext"><strong>Claude</strong>
+            <div className="sub" role="status">{busyAction === "claudeUpdate" ? updateActivity : !claudeResult ? t("offline.updateChecking") :
+              claudeResult.kind === "available" ? claudeResult.currentVersion + " → " + claudeResult.latestVersion + " · Code " + claudeResult.codeVersion :
+              claudeResult.kind === "failed" ? claudeResult.message :
+              t(claudeResult.kind === "none" ? "claude.current" : claudeResult.kind === "recover" ? "claude.recover" : "dual.claudeNotInstalled")}</div>
+            {claudeUpdateFailure && <div role="alert" className="sub">{claudeUpdateFailure.detail || claudeUpdateFailure.message}</div>}</div>
+            {claudeResult?.kind === "available" && <button className="btn primary" disabled={!!busyAction}
+              onClick={() => void applyClaudeUpdate()}>{t(busyAction === "claudeUpdate" ? "dual.updatingClaude" : claudeUpdateFailure ? "skillRepo.retry" : "dual.updateOnlyClaude")}</button>}
+          </div>
+        </div>
+        <button className="btn ghost" disabled={!!busyAction} onClick={() => setUpdatesOpen(false)}>{t("nav.close")}</button>
+      </Sheet>
+      <Sheet
         open={codexUpdateConfirmOpen && Boolean(pendingCodexUpdate)}
         onDismiss={() => {
           if (busyAction === "update") return;
@@ -1888,7 +1995,7 @@ export function OfflineHome({
         <Ring icon="download" />
         <h3 id={updateTitleId}>
           {pendingCodexUpdate
-            ? t(dualEdition && !usbGuard?.reinstallAllowed ? "dual.updateConfirmTitle" : "offline.updateConfirmTitle", {
+            ? t("offline.updateConfirmTitle", {
                 version: pendingCodexUpdate.latestVersion,
               })
             : ""}
@@ -1918,11 +2025,19 @@ export function OfflineHome({
         </div>
       </Sheet>
       <OfflineComponentsSheet
+        dualEdition={dualEdition}
         open={componentsOpen}
         onDismiss={() => setComponentsOpen(false)}
+        onRepaired={() => {
+          setCapabilityInstallError(null);
+          const warning = lastComponentWarning.current;
+          if (warning) setNotice(current => current?.replace(warning, "").trim() || null);
+          lastComponentWarning.current = null;
+        }}
         view={componentsView}
       />
       <UpstreamModelManagerSheet
+        key={(usbGuard?.bundlePath ?? "") + "|" + (usbGuard?.codexAllowed ?? "") + "|" + (hostStatus?.accountReady ?? "")}
         dualEdition={dualEdition}
         open={modelManagerOpen && showInstalled}
         onDismiss={() => setModelManagerOpen(false)}

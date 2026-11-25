@@ -7,7 +7,11 @@ try {
     if (!(Get-ExecutionPolicy -List | Where-Object ExecutionPolicy -ne Undefined)) {
         Set-ExecutionPolicy RemoteSigned -Scope Process -Force
     }
-    & (Join-Path $env:CAM_CLAUDE_MEDIA 'claude-desktop-worker.ps1')
+    if ($env:CAM_CLAUDE_ACTION -ceq 'stage') {
+        & (Join-Path $env:CAM_CLAUDE_MEDIA 'claude-desktop-stage.ps1')
+    } else {
+        & (Join-Path $env:CAM_CLAUDE_MEDIA 'claude-desktop-worker.ps1')
+    }
     exit $LASTEXITCODE
 } catch [System.Management.Automation.PSSecurityException] {
     exit 39

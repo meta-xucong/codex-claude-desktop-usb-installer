@@ -374,6 +374,7 @@ def check_feishu(audit: Audit) -> None:
     template = template_path.read_text(encoding="utf-8")
     rendered = template
     replacements = {
+        "__WINDOWS_POWERSHELL__": json.dumps(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
         "__FEISHU_ENABLED__": "false",
         "__FEISHU_WRAPPER__": '"C:\\\\safe\\\\start-feishu-mcp.ps1"',
         "__FEISHU_MCP_CACHE__": '"C:\\\\safe\\\\feishu-cache"',

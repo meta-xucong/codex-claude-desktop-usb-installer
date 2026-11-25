@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 
 import { errorMessage, managerApi } from "../../services/managerApi";
 import type {
@@ -17,7 +18,21 @@ function newRequestId(prefix: string) {
 }
 
 type ModelRow = GatewayProbeModel & { activeOnly?: boolean };
+
 type Availability = "passed" | "failed";
+function ModelListRow({ testId, model, title, status, statusTitle, actions, children }: {
+  testId: string; model: string; title?: string; status: string; statusTitle?: string;
+  actions: ReactNode; children?: ReactNode;
+}) {
+  return <li data-testid={testId}>
+    <div className="upstream-model-manager-model">
+      <strong className="upstream-model-manager-model-id" title={title ?? model} dir="ltr">{model}</strong>
+      <small className="upstream-model-manager-row-status" title={statusTitle ?? status} aria-live="polite">{status}</small>
+    </div>
+    <div className="upstream-model-manager-row-actions">{actions}</div>
+    {children}
+  </li>;
+}
 type RetryableAdd = { modelId: string; proofId: string; probeRequestId: string; expiresAtMs: number };
 const REASONING_EFFORT_CANDIDATES = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 function reasoningEffortCandidates(modelId: string) {
@@ -169,6 +184,16 @@ export function UpstreamModelManagerSheet({
   dualEdition?: boolean;
 }) {
   const { t } = useI18n();
+  const [tab, setTab] = useState<"codex" | "claude">("codex");
+  const [claude, setClaude] = useState<Awaited<ReturnType<typeof managerApi.manageClaudeModels>> | null>(null);
+  const [claudeError, setClaudeError] = useState<string | null>(null);
+  const [claudeOperation, setClaudeOperation] = useState<"state" | "refresh" | "add" | "default" | "reset" | "test" | null>(null);
+  const claudeBusy = claudeOperation !== null;
+  const [claudeRow, setClaudeRow] = useState<{ id: string; stage: "preparing" | "probing" | "saving" } | null>(null);
+  const [claudeFailures, setClaudeFailures] = useState<Record<string, string>>({});
+  const [claudePassed, setClaudePassed] = useState<string[]>([]);
+  const [codexDefault, setCodexDefault] = useState<string | null>(null);
+  const claudeSequence = useRef(0);
   const titleId = useId();
   const descriptionId = useId();
   const [report, setReport] = useState<GatewayModelProbeReport | null>(() => readProbeCache()?.report ?? null);
@@ -206,6 +231,7 @@ export function UpstreamModelManagerSheet({
       const state = await managerApi.manageNativeModelCatalog({ operation: "state" });
       if (session.current !== expectedSession) return null;
       setActiveIds(state.modelIds ?? []);
+      setCodexDefault(state.defaultModel ?? null);
       setCatalogStatus(state.status);
       if (state.status === "orphaned") {
         setError(t("offline.nativeModelManagerOrphaned"));
@@ -261,7 +287,7 @@ export function UpstreamModelManagerSheet({
       requestId = newRequestId("upstream-discovery");
       requestIds.current.add(requestId);
       const [state, next] = await Promise.all([
-        managerApi.manageNativeModelCatalog({ operation: "state" }),
+        refreshCatalogState(currentSession),
         managerApi.gatewayModelProbe({
           requestId,
           selectedModelIds: [],
@@ -269,9 +295,6 @@ export function UpstreamModelManagerSheet({
         }),
       ]);
       if (session.current !== currentSession) return;
-      setActiveIds(state.modelIds ?? []);
-      setCatalogStatus(state.status);
-      if (state.status === "orphaned") setError(t("offline.nativeModelManagerOrphaned"));
       if (next.status === "connected") {
         setReport(next);
         setFailedTestIds([]);
@@ -280,7 +303,7 @@ export function UpstreamModelManagerSheet({
         setCacheUpdatedAtMs(writeProbeCache(next, {}, []));
       } else {
         if (!report) setReport(next);
-        setError(state.status === "orphaned" ? t("offline.nativeModelManagerOrphaned") : t("offline.nativeModelManagerError"));
+        setError(state?.status === "orphaned" ? t("offline.nativeModelManagerOrphaned") : t("offline.nativeModelManagerError"));
       }
     } catch {
       if (session.current !== currentSession) return;
@@ -289,10 +312,19 @@ export function UpstreamModelManagerSheet({
       if (requestId) requestIds.current.delete(requestId);
       if (session.current === currentSession) setLoading(false);
     }
-  }, [addingId, cancelOutstanding, loading, reasoningTestingId, report, resetting, t, testingId]);
+  }, [addingId, cancelOutstanding, loading, reasoningTestingId, refreshCatalogState, report, resetting, t, testingId]);
 
   useLayoutEffect(() => {
     if (!open && wasOpen.current) {
+      ++claudeSequence.current;
+      setTab("codex");
+      setClaude(null);
+      setClaudeError(null);
+      setClaudeOperation(null);
+      setClaudeRow(null);
+      setClaudeFailures({});
+      setClaudePassed([]);
+      setConfirmBulkTest(false);
       wasOpen.current = false;
       session.current += 1;
       setLoading(false);
@@ -307,6 +339,8 @@ export function UpstreamModelManagerSheet({
   useEffect(() => {
     if (!open || wasOpen.current) return;
     wasOpen.current = true;
+    setCatalogStatus(null);
+    setActiveIds([]);
     const currentSession = ++session.current;
     const cache = readProbeCache();
     if (cache) {
@@ -354,11 +388,7 @@ export function UpstreamModelManagerSheet({
         if (session.current !== currentSession) return;
         if (prepared.status === "already_added" || prepared.status === "applied_restart_pending") {
           setActiveIds(prepared.modelIds ?? []);
-          if (prepared.errorCode === "claude-sync-pending") {
-            setError(t("dual.modelsPending"));
-            return;
-          }
-          setMessage(dualEdition ? t("dual.modelsUpdated") : prepared.status === "already_added"
+          setMessage(prepared.status === "already_added"
             ? t("offline.nativeModelManagerAlreadyAdded")
             : t("offline.nativeModelManagerAdded"));
           retryableAdd.current = null;
@@ -367,6 +397,11 @@ export function UpstreamModelManagerSheet({
         }
         if (prepared.status !== "ready") throw new Error(prepared.message || t("offline.nativeModelManagerError"));
 
+        if (dualEdition && prepared.modelIds?.includes(model.id)) {
+          setActiveIds(prepared.modelIds);
+          setMessage(t("offline.nativeModelManagerAlreadyAdded"));
+          return;
+        }
         probeRequestId = newRequestId("upstream-reasoning");
         requestIds.current.add(probeRequestId);
         const next = await managerApi.gatewayModelProbe({
@@ -422,8 +457,7 @@ export function UpstreamModelManagerSheet({
       if (result.status === "applied_restart_pending" || result.status === "already_added") {
         setActiveIds(result.modelIds ?? []);
         setError(null);
-        if (result.errorCode === "claude-sync-pending") setError(t("dual.modelsPending"));
-        else setMessage(t(dualEdition ? "dual.modelsUpdated" : "offline.nativeModelManagerAdded"));
+        setMessage(t("offline.nativeModelManagerAdded"));
         retryableAdd.current = null;
         setRetryableAddModelId(null);
       } else if (result.retryable && proofId && probeRequestId && proofExpiresAtMs > Date.now()) {
@@ -575,9 +609,7 @@ export function UpstreamModelManagerSheet({
           : result.status === "already_native"
             ? t("offline.nativeModelManagerResetAlready")
             : t("offline.nativeModelManagerResetDone");
-      if (result.errorCode === "claude-sync-pending") {
-        setError(t("dual.modelsPending"));
-      } else if (result.status === "cleanup_pending" || result.status === "outcome_unconfirmed") {
+      if (result.status === "cleanup_pending" || result.status === "outcome_unconfirmed") {
         setMessage(null);
         setError(resultMessage);
       } else {
@@ -593,7 +625,7 @@ export function UpstreamModelManagerSheet({
   }, [addingId, cancelOutstanding, loading, reasoningTestingId, refreshCatalogState, resetting, t, testingId]);
 
   const rows: ModelRow[] = report?.models.map((model) => ({ ...model })) ?? [];
-  const activeOnlyRows: ModelRow[] = report && (report.status === "connected" || report.status === "passed")
+  const activeOnlyRows: ModelRow[] = activeIds.length > 0
     ? activeIds
       .filter((id) => !rows.some((row) => row.id === id))
       .map((id) => ({ id, ownedBy: null, selectable: false, activeOnly: true }))
@@ -606,9 +638,144 @@ export function UpstreamModelManagerSheet({
   const catalogActionReasonId = `${titleId}-catalog-action-reason`;
   const managerTooltip = `${t("offline.nativeModelManagerSteps")}\n\n${t("offline.nativeModelManagerCostWarning")}`;
   const operationBusy = Boolean(loading || testingId || reasoningTestingId || addingId || resetting || addRequestId.current || bulkProgress);
-  const bulkTestableModels = report?.models.filter((model) => model.selectable) ?? [];
+  const claudeTab = dualEdition && tab === "claude";
+  const bulkTestableModels = claudeTab ? claude?.directory ?? [] : report?.models.filter((model) => model.selectable) ?? [];
   const bulkRequestMinimum = bulkTestableModels.length;
   const bulkRequestEstimate = bulkTestableModels.length;
+
+  async function claudeAction(action: "state" | "refresh" | "add" | "default" | "reset", id?: string) {
+    const seq = ++claudeSequence.current;
+    setClaudeOperation(action);
+    setClaudeError(null);
+    if (id) {
+      setClaudeRow({ id, stage: action === "add" ? "preparing" : "saving" });
+      setClaudeFailures(previous => { const next = {...previous}; delete next[id]; return next; });
+    }
+    try {
+      const view = action === "add" && id
+        ? await managerApi.manageClaudeModels(action, id, claude?.binding, stage => {
+          if (seq === claudeSequence.current) setClaudeRow({ id, stage });
+        })
+        : await managerApi.manageClaudeModels(action, id, claude?.binding);
+      if (seq !== claudeSequence.current) return;
+      setClaude(view);
+      if (action === "state" && view.ready) {
+        const refreshed = await managerApi.manageClaudeModels("refresh", undefined, view.binding);
+        if (seq === claudeSequence.current) setClaude(refreshed);
+      }
+    } catch (cause) {
+      if (seq === claudeSequence.current) {
+        const reason = errorMessage(cause).replace(/^update engine error:\s*/i, "");
+        if (id) setClaudeFailures(previous => ({...previous, [id]: reason}));
+        else setClaudeError(reason);
+      }
+    } finally {
+      if (seq === claudeSequence.current) {
+        ++claudeSequence.current;
+        setClaudeOperation(null);
+        setClaudeRow(null);
+      }
+    }
+  }
+
+  useEffect(() => () => { ++claudeSequence.current; }, []);
+
+  async function testClaudeDirectory() {
+    if (claudeBusy || !claude?.ready) return;
+    const seq = ++claudeSequence.current;
+    setConfirmBulkTest(false);
+    setClaudeOperation("test");
+    setClaudeError(null);
+    setMessage(null);
+    let passed = 0;
+    try {
+      for (const [index, id] of claude.directory.entries()) {
+        setBulkProgress({current: index + 1, total: claude.directory.length});
+        setClaudeRow({id, stage: "probing"});
+        const result = await managerApi.testClaudeModel(id, claude.binding);
+        if (seq !== claudeSequence.current) return;
+        if (!result.ready) throw new Error(t("dual.syncWaiting"));
+        const reason = result.probeError;
+        setClaudeFailures(previous => {
+          const next = {...previous};
+          if (reason) next[id] = reason; else delete next[id];
+          return next;
+        });
+        setClaudePassed(previous => reason ? previous.filter(item => item !== id) : [...previous.filter(item => item !== id), id]);
+        if (!reason) passed++;
+      }
+      setMessage(t("offline.nativeModelManagerTestAllDone", {passed, failed: claude.directory.length - passed}));
+    } catch (cause) {
+      if (seq === claudeSequence.current) setClaudeError(errorMessage(cause));
+    } finally {
+      if (seq === claudeSequence.current) {
+        ++claudeSequence.current;
+        setClaudeOperation(null);
+        setClaudeRow(null);
+        setBulkProgress(null);
+      }
+    }
+  }
+
+  async function applyCodexDefault(id: string) {
+    const current = session.current;
+    setAddingId(id);
+    setError(null);
+    try {
+      const state = await managerApi.manageNativeModelCatalog({ operation: "default", modelId: id });
+      if (session.current === current) setCodexDefault(state.defaultModel ?? null);
+    } catch (cause) {
+      if (session.current === current) setError(errorMessage(cause));
+    } finally {
+      if (session.current === current) setAddingId(null);
+    }
+  }
+
+  const configured = claude?.configured ?? [];
+  const directory = claude?.directory ?? [];
+  const claudeDefault = configured[0];
+  const claudeMembers = new Set([...configured, ...(claude?.native ?? [])]);
+
+  const refreshing = claudeTab ? (claudeOperation === "state" || claudeOperation === "refresh") : loading;
+  const toolbar = <>
+        <div className="upstream-model-manager-toolbar">
+          <button
+            type="button"
+            className="btn primary upstream-model-manager-compact-action"
+            onClick={() => claudeTab ? void claudeAction("refresh") : void discover()}
+            disabled={operationBusy || claudeBusy}
+            title={t(claudeTab ? "offline.nativeModelManagerRefresh" : "offline.nativeModelManagerSteps")}
+          >
+            {refreshing ? <Icon name="loader" className="spinicon" /> : <Icon name="refresh" />}
+            {refreshing ? t("offline.nativeModelManagerDiscovering") : t("offline.nativeModelManagerRefresh")}
+          </button>
+          <button
+            type="button"
+            className="btn ghost upstream-model-manager-compact-action"
+            onClick={() => claudeTab ? setConfirmBulkTest(true) : void testAllModels()}
+            disabled={operationBusy || claudeBusy || !bulkTestableModels.length || (claudeTab ? !claude?.ready : catalogStatus !== "ok")}
+            title={t("offline.nativeModelManagerCostWarning")}
+          >
+            {bulkProgress
+              ? t("offline.nativeModelManagerTestAllProgress", bulkProgress)
+              : t("offline.nativeModelManagerTestAll")}
+          </button>
+        </div>
+            {confirmBulkTest ? (
+              <div className="upstream-model-manager-bulk-confirm" role="alertdialog" aria-label={t("offline.nativeModelManagerTestAllConfirm", { count: bulkTestableModels.length, minimum: bulkRequestMinimum, requests: bulkRequestEstimate })}>
+                <p>{t("offline.nativeModelManagerTestAllConfirm", { count: bulkTestableModels.length, minimum: bulkRequestMinimum, requests: bulkRequestEstimate })}</p>
+                <div className="upstream-model-manager-add-footer">
+                  <button type="button" className="btn ghost upstream-model-manager-compact-action" onClick={() => setConfirmBulkTest(false)}>
+                    {t("confirm.cancel")}
+                  </button>
+                  <button type="button" className="btn primary upstream-model-manager-compact-action" onClick={() => claudeTab ? void testClaudeDirectory() : void runTestAllModels()}>
+                    {t("offline.nativeModelManagerTestAllStart")}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+
+  </>;
 
   return (
     <Sheet
@@ -636,44 +803,45 @@ export function UpstreamModelManagerSheet({
           </div>
         </div>
 
+        {dualEdition && <div className="upstream-model-manager-toolbar" role="group" aria-label={t("dual.modelApp")}>
+          <button className={tab === "codex" ? "btn primary" : "btn ghost"} aria-pressed={tab === "codex"} disabled={operationBusy || claudeBusy} onClick={() => { setConfirmBulkTest(false); setMessage(null); setTab("codex"); }}>Codex</button>
+          <button className={tab === "claude" ? "btn primary" : "btn ghost"} aria-pressed={tab === "claude"} disabled={operationBusy || claudeBusy} onClick={() => {
+            setConfirmBulkTest(false);
+            setMessage(null);
+            setTab("claude");
+            if (!claude && !claudeBusy) void claudeAction("state");
+          }}>Claude Code</button>
+        </div>}
+        {dualEdition && tab === "claude" ? <>
+          {claude?.ready === false ? <p>{t("dual.syncWaiting")}</p> : <>
+            <p>{t(configured.length ? "dual.claudeCustom" : "dual.claudeAuto")}</p>
+            <p className="upstream-model-manager-cost-note">{t("dual.claudeProbeCost")}</p>
+            {toolbar}
+            <ul className="upstream-model-manager-list">{[...new Set([...directory, ...configured])].map(id => {
+              const added = claudeMembers.has(id);
+              const stage = claudeRow?.id === id ? claudeRow.stage : null;
+              const pending = stage === "preparing" ? t("dual.modelPreparing")
+                : stage === "saving" ? t("dual.modelSaving")
+                : stage === "probing" ? t("offline.nativeModelManagerTesting") : null;
+              const reason = claudeFailures[id];
+              const membership = added ? t("dual.claudeAdded") : t(claudePassed.includes(id)
+                ? "offline.nativeModelManagerAvailabilityPassed" : "offline.nativeModelManagerNotTested");
+              const status = pending ?? (reason ? (added ? membership + " · " + reason : reason) : membership);
+              return <ModelListRow key={id} model={id} testId={"claude-model-" + id} status={status}
+                actions={id === claudeDefault ? <span>{t("dual.modelDefault")}</span> :
+                  <button type="button" className={`btn ${added ? "ghost" : "primary"} upstream-model-manager-compact-action`}
+                    disabled={claudeBusy} onClick={() => void claudeAction(added ? "default" : "add", id)}>
+                    {pending ?? t(added ? "dual.makeDefault" : reason ? "offline.nativeModelManagerRetryPrepare" : "offline.nativeModelManagerPrepareAdd")}
+                  </button>} />;
+            })}</ul>
+            {message && <p role="status">{message}</p>}
+            {configured.length > 0 && <button className="btn ghost" disabled={claudeBusy} onClick={() => void claudeAction("reset")}>{t("offline.nativeModelManagerReset")}</button>}
+          </>}
+          {claudeError && <p role="alert">{claudeError}</p>}
+        </> : <>
+        {dualEdition && <p>{codexDefault ? t("dual.currentDefault", { model: codexDefault }) : t("dual.appDefault")}</p>}
         <p className="upstream-model-manager-cost-note">{t("offline.nativeModelManagerProbeAddCost")}</p>
-
-        <div className="upstream-model-manager-toolbar">
-          <button
-            type="button"
-            className="btn primary upstream-model-manager-compact-action"
-            onClick={() => void discover()}
-            disabled={operationBusy}
-            title={t("offline.nativeModelManagerSteps")}
-          >
-            {loading ? <Icon name="loader" className="spinicon" /> : <Icon name="refresh" />}
-            {loading ? t("offline.nativeModelManagerDiscovering") : t("offline.nativeModelManagerRefresh")}
-          </button>
-          <button
-            type="button"
-            className="btn ghost upstream-model-manager-compact-action"
-            onClick={() => void testAllModels()}
-            disabled={operationBusy || !report || report.models.every((model) => !model.selectable) || catalogStatus !== "ok"}
-            title={t("offline.nativeModelManagerCostWarning")}
-          >
-            {bulkProgress
-              ? t("offline.nativeModelManagerTestAllProgress", bulkProgress)
-              : t("offline.nativeModelManagerTestAll")}
-          </button>
-        </div>
-            {confirmBulkTest ? (
-              <div className="upstream-model-manager-bulk-confirm" role="alertdialog" aria-label={t("offline.nativeModelManagerTestAllConfirm", { count: bulkTestableModels.length, minimum: bulkRequestMinimum, requests: bulkRequestEstimate })}>
-                <p>{t("offline.nativeModelManagerTestAllConfirm", { count: bulkTestableModels.length, minimum: bulkRequestMinimum, requests: bulkRequestEstimate })}</p>
-                <div className="upstream-model-manager-add-footer">
-                  <button type="button" className="btn ghost upstream-model-manager-compact-action" onClick={() => setConfirmBulkTest(false)}>
-                    {t("confirm.cancel")}
-                  </button>
-                  <button type="button" className="btn primary upstream-model-manager-compact-action" onClick={() => void runTestAllModels()}>
-                    {t("offline.nativeModelManagerTestAllStart")}
-                  </button>
-                </div>
-              </div>
-            ) : null}
+        {toolbar}
 
         {report && cacheUpdatedAtMs !== null ? (
           <small
@@ -720,6 +888,7 @@ export function UpstreamModelManagerSheet({
                       ? t("offline.nativeModelReasoningTesting")
                     : isActive
                       ? t("offline.nativeModelManagerActive")
+                      : catalogStatus !== "ok" ? t(catalogStatus === null ? "dual.modelsLoading" : "dual.modelsUnknown")
                       : availability === "passed"
                         ? t("offline.nativeModelManagerAvailabilityPassed")
                         : failed
@@ -738,24 +907,11 @@ export function UpstreamModelManagerSheet({
                   ? reasonId
                   : undefined;
               return (
-                <li key={`${model.id}:${model.ownedBy ?? ""}:${index}`} data-testid={`upstream-model-${model.id}`}>
-                  <div className="upstream-model-manager-model">
-                    <strong
-                      className="upstream-model-manager-model-id"
-                      title={model.ownedBy ? `${model.id} · ${model.ownedBy}` : model.id}
-                      dir="ltr"
-                    >
-                      {model.id}
-                    </strong>
-                    <small
-                      className="upstream-model-manager-row-status"
-                      title={failed ? `${actionStatus} · ${failureReason}${failureCode ? ` (${failureCode})` : ""}` : actionStatus}
-                    >
-                      {actionStatus}
-                    </small>
-                  </div>
-                  <div className="upstream-model-manager-row-actions">
-                    {(!isActive || (dualEdition && /^(anthropic\/)?claude-(sonnet|haiku|opus|fable)-/.test(model.id))) && !model.activeOnly ? (
+                <ModelListRow key={`${model.id}:${model.ownedBy ?? ""}:${index}`} testId={`upstream-model-${model.id}`}
+                  model={model.id} title={model.ownedBy ? `${model.id} · ${model.ownedBy}` : model.id}
+                  status={actionStatus} statusTitle={failed ? `${actionStatus} · ${failureReason}${failureCode ? ` (${failureCode})` : ""}` : actionStatus}
+                  actions={<>
+                    {!isActive && !model.activeOnly ? (
                       <>
                         <button
                           type="button"
@@ -787,9 +943,11 @@ export function UpstreamModelManagerSheet({
                         ) : null}
                       </>
                     ) : (
-                      <span className="upstream-model-manager-row-status-spacer" aria-hidden="true" />
+                      dualEdition && isActive && model.id !== codexDefault
+                        ? <button className="btn ghost" disabled={operationBusy} onClick={() => void applyCodexDefault(model.id)}>{t("dual.makeDefault")}</button>
+                        : <span className="upstream-model-manager-row-status-spacer" aria-hidden="true" />
                     )}
-                  </div>
+                  </>}>
                   {!isActive && !model.activeOnly && report?.reasoningModelId === model.id && report.reasoningResults?.length ? (
                     <details className="upstream-model-manager-reasoning-details">
                       <summary>{t("offline.nativeModelReasoningResults")}</summary>
@@ -807,7 +965,7 @@ export function UpstreamModelManagerSheet({
                       </ul>
                     </details>
                   ) : null}
-                </li>
+                </ModelListRow>
               );
             })}
           </ul>
@@ -825,6 +983,8 @@ export function UpstreamModelManagerSheet({
               {activeOnlyRows.map((model) => (
                 <li key={model.id} data-testid={"upstream-model-configured-only-" + model.id}>
                   <strong className="upstream-model-manager-model-id" dir="ltr">{model.id}</strong>
+                  <small>{t("offline.nativeModelManagerActive")}</small>
+                  {dualEdition && model.id !== codexDefault && <button className="btn ghost" disabled={operationBusy} onClick={() => void applyCodexDefault(model.id)}>{t("dual.makeDefault")}</button>}
                 </li>
               ))}
             </ul>
@@ -846,6 +1006,7 @@ export function UpstreamModelManagerSheet({
             {resetting ? t("offline.nativeModelManagerResetting") : t("offline.nativeModelManagerReset")}
           </button>
         </div>
+        </>}
       </div>
     </Sheet>
   );

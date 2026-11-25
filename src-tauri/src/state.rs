@@ -35,6 +35,7 @@ pub struct ManagerState {
     /// same handoff instead of relying on a timer that can make the result
     /// invisible. The enum also retains an exit-authorized state as a write
     /// barrier while the operating system is closing the process.
+    pub(crate) pending_uninstall_profile: Mutex<Option<crate::commands::PendingUninstallProfile>>,
     pub(crate) uninstall_handoff: Mutex<UninstallHandoffState>,
     /// Windows release windows stay hidden until WebView2's native browser
     /// accelerators have been disabled. The single-instance focus path must not
@@ -106,6 +107,7 @@ impl ManagerState {
             settings,
             endpoints,
             force_quit: AtomicBool::new(false),
+            pending_uninstall_profile: Mutex::new(None),
             uninstall_handoff: Mutex::new(UninstallHandoffState::None),
             #[cfg(target_os = "windows")]
             webview_safe_to_show: AtomicBool::new(initial_webview_safe_to_show(cfg!(dev))),

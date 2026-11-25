@@ -319,13 +319,14 @@ export interface LocalMediaModelSettings {
 }
 
 export interface NativeModelCatalogActionRequest {
-  operation: "state" | "prepare" | "add" | "reset";
+  operation: "state" | "prepare" | "add" | "default" | "reset";
   requestId?: string;
   modelId?: string;
   connectivityProofId?: string;
 }
 
 export interface NativeModelCatalogActionReport {
+  defaultModel?: string | null;
   status: string;
   modelIds: string[];
   restartRequired: boolean;
@@ -342,6 +343,7 @@ export interface NativeModelCatalogActionReport {
  * current install and writes configured values to the current user's private
  * environment after a successful run. */
 export interface CapabilityPackInstallOptions {
+  connectionEdits?: string[];
   enableFeishu: boolean;
   feishuAction?: "apply" | "preserve";
   persistConnections: boolean;
@@ -368,6 +370,8 @@ export interface CapabilityPackInstallOptions {
 }
 
 export interface CapabilityPackReport {
+  claudeSync?: "synced" | "pending" | "failed";
+  connectionSettings?: { remote: string[]; api: string[]; media: boolean; dashscopeConfigured: boolean; dashscopeBaseUrl: string; dashscopeModel: string };
   available: boolean;
   installed: boolean;
   success: boolean;
@@ -1008,6 +1012,7 @@ export interface WinUninstallReport {
 
 /** Combined Windows cleanup used by the USB build. */
 export interface WinBundleUninstallReport {
+  profileRetryId?: string | null;
   success: boolean;
   codex: WinUninstallReport | null;
   codexError: string | null;
@@ -1027,6 +1032,7 @@ export interface WinBundleUninstallReport {
 }
 
 export interface UninstallHandoffStatus {
+  profileRetry?: boolean;
   id: string;
   reportPath: string;
   message: string;

@@ -25,27 +25,35 @@ index a1333c9004b13c4e3d48c69b11138711fa943c39..0ef2f05d7120d560847fa88651ae3ed3
          .store_builder("app_paths.json")
          .build()
 diff --git a/src-tauri/src/claude_desktop_config.rs b/src-tauri/src/claude_desktop_config.rs
-index dd8461c7a70e0b736317027681440c07dae0108f..ef32210ea05bcd530c819a1da337d9c964e5e309 100644
+index dd8461c7a70e0b736317027681440c07dae0108f..8e508e5fa84d2ce4e16654ead2e5f54e79258e37 100644
 --- a/src-tauri/src/claude_desktop_config.rs
 +++ b/src-tauri/src/claude_desktop_config.rs
-@@ -1117,6 +1117,22 @@ fn direct_profile(provider: &Provider) -> Result<Value, AppError> {
+@@ -1117,6 +1117,30 @@ fn direct_profile(provider: &Provider) -> Result<Value, AppError> {
      validate_direct_provider(provider)?;
      let credentials = direct_gateway_credentials(provider)?;
      let model_specs = direct_inference_model_specs(provider)?;
 +    if provider.id == "404token-sub2api" && credentials.base_url == "https://404token.xyz" {
 +        if let Some(home) = crate::config::usb_app_config_dir() {
 +            let helper = home.with_file_name("claude-desktop").join("Get-UsbClaudeCredential.ps1");
-+            let mut models = Value::Array(model_specs.iter().map(inference_model_json).collect());
-+            if model_specs.is_empty() {
++            let mut profile = json!({"inferenceProvider":"gateway","inferenceGatewayBaseUrl":credentials.base_url,
++                "inferenceCredentialHelper":helper,"modelCatalogEnabled":false,"disableAutoUpdates":true});
++            if !model_specs.is_empty() {
++                profile["inferenceModels"] = Value::Array(model_specs.iter().map(inference_model_json).collect());
++            } else {
 +                let paths = current_platform_paths()?;
 +                let prev = read_json_or_empty(&paths.profile_path)?;
-+                models = if prev.get("inferenceCredentialHelper") == Some(&json!(&helper)) {
-+                    prev.get("inferenceModels").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())).cloned()
-+                } else { None }.unwrap_or_else(|| json!([{"name":"claude-haiku-5-5"}]));
++                if prev.get("inferenceCredentialHelper") == profile.get("inferenceCredentialHelper") {
++                    if let Some(discovery) = prev.get("modelDiscoveryEnabled") {
++                        profile["modelDiscoveryEnabled"] = discovery.clone();
++                    }
++                    if let Some(models) = prev.get("inferenceModels").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
++                        // An explicit model list overrides the gateway's native discovery.
++                        let old_default = models == &json!([{"name":"claude-haiku-5-5"}]) && prev.get("modelDiscoveryEnabled").is_none();
++                        if !old_default { profile["inferenceModels"] = models.clone(); }
++                    }
++                }
 +            }
-+            return Ok(json!({"inferenceProvider":"gateway","inferenceGatewayBaseUrl":credentials.base_url,
-+                "inferenceCredentialHelper":helper,"inferenceModels":models,
-+                "modelCatalogEnabled":false,"disableAutoUpdates":true}));
++            return Ok(profile);
 +        }
 +    }
      Ok(build_gateway_profile(
@@ -3063,10 +3071,10 @@ index 720b0e87af48322963af83b49f62b633331cc47d..d3cf719690fc2d2ae38d95549f529beb
  
 diff --git a/src-tauri/src/services/provider/usb_bootstrap.rs b/src-tauri/src/services/provider/usb_bootstrap.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..1276cd1ae61fbf0e66ef381578d323d70ff651c1
+index 0000000000000000000000000000000000000000..8c83d6bcb70ca49c1164f0c01376871434f475af
 --- /dev/null
 +++ b/src-tauri/src/services/provider/usb_bootstrap.rs
-@@ -0,0 +1,968 @@
+@@ -0,0 +1,977 @@
 +//! USB credential handoff adapted to the official 4.x field-write transaction.
 +//! Never restore a 3.x whole-file snapshot over the 4.x recovery journal.
 +use super::ProviderService;
@@ -3630,6 +3638,15 @@ index 0000000000000000000000000000000000000000..1276cd1ae61fbf0e66ef381578d323d7
 +            assert_eq!(profile["inferenceGatewayBaseUrl"], credentials.base_url);
 +            assert!(profile["inferenceCredentialHelper"].as_str().unwrap().ends_with("Get-UsbClaudeCredential.ps1"));
 +            assert!(profile.get("inferenceGatewayApiKey").is_none());
++            assert!(profile.get("inferenceModels").is_none());
++            profile["inferenceModels"] = serde_json::json!([{"name":"claude-haiku-5-5"}]);
++            std::fs::write(&path, serde_json::to_vec(&profile).unwrap()).unwrap();
++            ProviderService::prepare_usb_claude_desktop(state, key).unwrap();
++            assert!(read(&path).get("inferenceModels").is_none());
++            profile["modelDiscoveryEnabled"] = false.into();
++            std::fs::write(&path, serde_json::to_vec(&profile).unwrap()).unwrap();
++            ProviderService::prepare_usb_claude_desktop(state, key).unwrap();
++            assert_eq!(read(&path), profile);
 +            profile["inferenceModels"] = serde_json::json!([{"name":"claude-sonnet-5"}]);
 +            profile["userPreference"] = true.into();
 +            std::fs::write(&path, serde_json::to_vec(&profile).unwrap()).unwrap();

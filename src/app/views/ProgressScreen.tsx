@@ -33,7 +33,7 @@ const hostSlots = [
   ["offline.host.verify"],
 ];
 const desktopSlots = [["desktop"], ["register", "service", "account"], ["profile"]];
-const codeSlots = [["runtime"], ["seed"], ["skills"], ["models"], ["connections"], ["finalize"]];
+const codeSlots = [["runtime"], ["seed"], ["skills"], ["connections"], ["finalize"]];
 
 function dualStagePercent(step: DualInstallStep, activityKey: string | null, phase: OperationPhase,
   extracted: number, compatibility: boolean): number {

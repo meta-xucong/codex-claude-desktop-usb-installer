@@ -1,3 +1,4 @@
+param([string]$PythonExe = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $source = Join-Path $repo 'installer-pack\install-to-codex.ps1'
@@ -14,7 +15,7 @@ if (-not $start) { throw 'Actual installer finalization entry not found' }
 $tail = [scriptblock]::Create($ast.Extent.Text.Substring($start.Extent.StartOffset))
 $fixture = Join-Path (Join-Path $repo 'tmp') ('cap-finalize-' + [guid]::NewGuid().ToString('N'))
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
-foreach ($case in @('media-failed','config-failed','model-failed','hyperframes-cli-failed','hyperframes-browser-failed','success')) {
+foreach ($case in @('media-failed','config-failed','model-failed','hyperframes-cli-failed','hyperframes-browser-failed','entry-disabled','entry-missing','wrong-wrapper','success')) {
     $caseRoot = Join-Path $fixture $case
     $PackRoot = Join-Path $caseRoot 'pack'
     $userProfile = Join-Path $caseRoot 'profile'
@@ -29,6 +30,7 @@ foreach ($case in @('media-failed','config-failed','model-failed','hyperframes-c
     $runtimeStatePath = Join-Path $ownershipRoot 'runtime-state.json'
     $ProgressFile = Join-Path $caseRoot 'progress.txt'
     New-Item -ItemType Directory -Force -Path $PackRoot,$skillTarget,$agentTarget,$diagnosticsRoot,(Join-Path $ownershipRoot 'bin'),(Join-Path $ownershipRoot 'config') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repo 'installer-pack\replace-pack-config.py') -Destination $PackRoot
     # Isolate external stages; execute the actual installer orchestration and writers.
     [IO.File]::WriteAllText((Join-Path $ownershipRoot 'bin\start-media-generation-mcp.ps1'), @'
 param([switch]$HealthCheck)
@@ -37,8 +39,11 @@ $global:LASTEXITCODE = 0
 '{"ready":true,"serverVersion":"1.3.11","healthScope":"local-runtime-protocol","runtimeStatus":"passed","protocolStatus":"passed","gatewayCatalogStatus":"not_checked","generationCapability":"not_tested","toolCount":6,"python":"fixture"}'
 '@, $utf8NoBom)
     [IO.File]::WriteAllText((Join-Path $PackRoot 'render-codex-config.ps1'), @'
-param($OutputPath)
-[IO.File]::WriteAllText($OutputPath, "[mcp_servers.media_generation]`nenabled = true`n")
+param($OutputPath,$MediaMcpWrapperPath)
+$entry = if ($case -eq 'entry-missing') { 'other' } else { 'media_generation' }
+$enabled = if ($case -eq 'entry-disabled') { 'false' } else { 'true' }
+$wrapperJson = if ($case -eq 'wrong-wrapper') { '"wrong.ps1"' } else { ConvertTo-Json $MediaMcpWrapperPath -Compress }
+[IO.File]::WriteAllText($OutputPath, "[mcp_servers.$entry]`ncommand = 'powershell.exe'`nargs = ['-File', $wrapperJson]`n# saved setting`nenabled = $enabled`n")
 '{"status":"ready","mediaGenerationEnabled":true}'
 '@, $utf8NoBom)
     [IO.File]::WriteAllText((Join-Path $PackRoot 'configure-codex.ps1'), @'
@@ -54,7 +59,7 @@ if ($case -eq 'model-failed') { throw 'fixture model sync failure' }
 '{"status":"ready","preferredModel":"fixture","migration":"kept"}'
 '@, $utf8NoBom)
     $runtimeState = [ordered]@{
-        status = 'ready'; python = @{ health = 'passed'; executable = '' }
+        status = 'ready'; python = @{ health = 'passed'; executable = $PythonExe }
         manim = @{ health = 'passed' }; node = @{ health = 'passed' }; ffmpeg = @{ health = 'passed' }
         hyperframes = @{ cliHealth = 'passed'; browserHealth = 'passed' }
         feishu = @{ health = 'disabled'; packageRoot = '' }; mediaGeneration = @{}
@@ -81,6 +86,15 @@ if ($case -eq 'model-failed') { throw 'fixture model sync failure' }
     if (-not (Test-Path -LiteralPath (Join-Path $ownershipRoot 'model-stage-ran'))) { throw "$case skipped model stage" }
     if (-not (Test-Path -LiteralPath $ownershipFile)) { throw "$case skipped ownership finalization" }
     if ((Get-Content -LiteralPath $ProgressFile -Raw) -ne 'pack.finalize') { throw "$case did not finish progress" }
+    $registration = switch ($case) {
+        'entry-disabled' { 'entry-disabled' }
+        'entry-missing' { 'entry-missing' }
+        'wrong-wrapper' { 'wrapper-mismatch' }
+        'config-failed' { 'config-unmerged' }
+        default { 'registered' }
+    }
+    if ($report.connections.mediaGeneration.registrationStatus -ne $registration -or
+        $report.connections.mediaGeneration.registered -ne ($registration -eq 'registered')) { throw "$case incorrect registration result" }
     if ($case -eq 'success') {
         if ($report.overallStatus -ne 'ready' -or $report.connections.mediaGeneration.protocol -ne 'passed') { throw 'Success was not retained' }
     } elseif ($report.overallStatus -ne 'partial') { throw "$case was not reported partial" }

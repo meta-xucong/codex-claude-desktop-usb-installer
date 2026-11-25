@@ -1,15 +1,48 @@
 import hashlib
 import importlib
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
 import zipfile
+from unittest.mock import patch
 
 sync = importlib.import_module("claude-update-relay-sync")
 
 
 class PairedReleaseTest(unittest.TestCase):
+    def test_exe_channel_keeps_last_pair_when_new_code_does_not_match(self):
+        with tempfile.TemporaryDirectory() as temp:
+            export = Path(temp)
+            config = export/"config.json"
+            config.write_text('{"min_free_bytes": 0}')
+            exe, code = b"fixture desktop", b"fixture runtime"
+            digest = hashlib.sha256(exe).hexdigest()
+            archive = hashlib.sha256(code).hexdigest()
+            def download(*args, **kwargs):
+                stream = io.BytesIO(exe)
+                stream.headers = {"Content-Length": str(len(exe))}
+                return stream
+            def release(version):
+                folder = export/version
+                folder.mkdir()
+                (folder/"code.zst").write_bytes(code)
+                return dict(desktop=version, code="2.1.328", archive=archive)
+            with patch.object(sync.relay, "DEFAULT_CONFIG", config), \
+                 patch.object(sync, "official_squirrel", return_value=("fixture",digest)), \
+                 patch.object(sync.urllib.request, "urlopen", side_effect=download), \
+                 patch.object(sync, "squirrel_code", return_value=("2.1.328",archive,len(code))) as pairing:
+                previous = sync.publish_squirrel(export, release("6.28899.2.0"))
+                next_pair = release("6.28899.6.0")
+                pairing.return_value = ("2.1.330",archive,len(code))
+                with self.assertRaises(ValueError):
+                    sync.publish_squirrel(export,next_pair)
+                channel = export/"squirrel"
+                self.assertEqual(json.loads((channel/"latest.json").read_text()),previous)
+                self.assertFalse((channel/next_pair["desktop"]).exists())
+                self.assertEqual((channel/previous["desktop"]/"code.zst").read_bytes(),code)
+
     def test_incomplete_new_pair_keeps_previous_release(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

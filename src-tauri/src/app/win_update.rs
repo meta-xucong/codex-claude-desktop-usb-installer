@@ -504,9 +504,8 @@ fn outcome_from_portable_uninstall(
     if outcome.cleanup.is_failed() {
         // Shortcut / uninstall-entry failures.
         if portable.notes.iter().any(|n| {
-            n.contains("Start Menu")
-                || n.contains("Apps & Features")
-                || n.contains("uninstall entry")
+            n.starts_with("Start Menu shortcut cleanup failed:")
+                || n.starts_with("Apps & Features uninstall entry cleanup failed:")
         }) {
             outcome.push_recovery(recovery::CLEANUP_METADATA);
         }
@@ -3534,7 +3533,6 @@ fn merge_extra_portable_uninstall(
     report: &mut WinUninstallReport,
     root: &Path,
     extra: PortableUninstallReport,
-    purge_user_data: bool,
 ) {
     if extra.success {
         report.notes.push(if extra.removed_files {
@@ -3542,9 +3540,6 @@ fn merge_extra_portable_uninstall(
         } else {
             format!("旧版 Codex 便携程序目录已不存在：{}", root.display())
         });
-        if purge_user_data {
-            report.purged_user_data |= extra.purged_user_data;
-        }
     }
     if !extra.success || extra.partial {
         let detail = format!(
@@ -3607,9 +3602,9 @@ fn uninstall_windows_codex_for_usb_bundle_impl(
         if installed.source != "portable" {
             continue;
         }
-        match uninstall_portable(&root, purge_user_data) {
+        match uninstall_portable(&root, false) {
             Ok(extra) => {
-                merge_extra_portable_uninstall(&mut report, &root, extra, purge_user_data);
+                merge_extra_portable_uninstall(&mut report, &root, extra);
             }
             Err(error) => {
                 let detail = format!("清理旧版 Codex 便携目录失败：{}；{error}", root.display());
@@ -3679,25 +3674,6 @@ fn uninstall_windows_codex_for_usb_bundle_impl(
         }
     }
 
-    // An already-absent package still permits explicit data purge, but a
-    // reported primary removal failure must not erase the still-used profile.
-    if purge_user_data && report.success {
-        let mut purge_notes = Vec::new();
-        match purge_codex_user_data(&mut purge_notes) {
-            Ok(purged) => {
-                report.purged_user_data |= purged;
-                report.notes.extend(purge_notes);
-            }
-            Err(error) => {
-                report.success = false;
-                let detail = format!("清理 Codex 用户数据失败：{error}");
-                report.notes.push(detail.clone());
-                report.outcome.cleanup = StepOutcome::failed(detail);
-                report.outcome.push_recovery(recovery::PURGE_USER_DATA);
-            }
-        }
-    }
-
     // Final current-user postcondition.  Do not report success if either an
     // AppX registration or a recognizable managed portable tree remains.
     let registration = codex_win_engine::registered_msix_package_full_name();
@@ -3715,9 +3691,17 @@ fn uninstall_windows_codex_for_usb_bundle_impl(
     }
 
     if report.success && report.message.contains("not installed") {
-        report.message = "Windows Codex 未安装；已完成残留元数据与数据检查。".to_string();
+        report.message = "Windows Codex 未安装；已检查残留的安装记录。".to_string();
     }
     Ok(report)
+}
+
+pub(crate) fn purge_bundle_codex_profile(notes: &mut Vec<String>) -> Result<bool, AppError> {
+    codex_win_engine::purge_codex_user_data_with_recovery(
+        notes,
+        Some(super::uninstall_cleanup::remove_tree_no_follow),
+    )
+    .map_err(engine_err)
 }
 
 fn same_windows_path_text(left: &str, right: &Path) -> bool {
@@ -3829,8 +3813,12 @@ fn uninstall_windows_codex_impl(
     settings: &AppSettings,
     confirm: bool,
     purge_user_data: bool,
-    allow_external_msix: bool,
+    usb_bundle: bool,
 ) -> Result<WinUninstallReport, AppError> {
+    // Bundle uninstall purges the shared profile once both apps and the guard
+    // have stopped. The original choice still governs AppX package data.
+    let purge_profile_now = purge_user_data && !usb_bundle;
+    let allow_external_msix = usb_bundle;
     log::info!(
         "Windows uninstall start purge_user_data={purge_user_data} allow_external_msix={allow_external_msix}"
     );
@@ -3985,7 +3973,7 @@ fn uninstall_windows_codex_impl(
             }
             // Honor the user's "don't keep my data" choice on the MSIX path too,
             // exactly like the portable path — remove ~/.codex when asked.
-            if purge_user_data {
+            if purge_profile_now {
                 match purge_codex_user_data(&mut notes) {
                     Ok(purged) => {
                         purged_user_data = purged;
@@ -4003,7 +3991,7 @@ fn uninstall_windows_codex_impl(
                         outcome.push_recovery(recovery::PURGE_USER_DATA);
                     }
                 }
-            } else {
+            } else if !purge_user_data {
                 notes.push(
                     "未清除独立的 .codex 用户目录；AppX 包内数据的保留或备份结果见卸载详细记录。"
                         .to_string(),
@@ -4045,7 +4033,7 @@ fn uninstall_windows_codex_impl(
 
     let portable = uninstall_portable(
         PathBuf::from(&installed_before.path).as_path(),
-        purge_user_data,
+        purge_profile_now,
     )
     .map_err(engine_err)?;
     let mut provenance = StepOutcome::ok();
@@ -4209,7 +4197,7 @@ where
 
     if actions.iter().any(|a| a == recovery::PURGE_USER_DATA) && purge_user_data {
         let mut notes = Vec::new();
-        match purge_codex_user_data(&mut notes).map_err(engine_err) {
+        match purge_bundle_codex_profile(&mut notes) {
             Ok(_) => {
                 outcome.cleanup = StepOutcome::ok_detail("user data purged");
                 messages.push("用户数据已清除".to_string());
@@ -4788,7 +4776,6 @@ mod tests {
                 &mut report,
                 std::path::Path::new(r"X:\fixture-only"),
                 extra,
-                false,
             );
             let finished =
                 super::finish_windows_uninstall(Ok(report), "usb_bundle", false).unwrap();
@@ -5511,15 +5498,15 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  OpenAI.Codex_2
             removed_uninstall_entry: true,
             purged_user_data: false,
             message: "cleanup warnings".into(),
-            notes: vec!["User data cleanup failed: access denied".into()],
+            notes: vec![
+                "Preserved unrelated/unverified Start Menu shortcut".into(),
+                "User data cleanup failed: access denied".into(),
+            ],
         };
         let outcome = outcome_from_portable_uninstall(&portable, StepOutcome::ok(), r"C:\Codex");
         assert!(outcome.primary_ok);
         assert!(outcome.is_partial());
-        assert!(outcome
-            .recovery_actions
-            .iter()
-            .any(|a| a == recovery::PURGE_USER_DATA));
+        assert_eq!(outcome.recovery_actions, [recovery::PURGE_USER_DATA]);
     }
 
     #[test]

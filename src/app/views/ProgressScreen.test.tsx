@@ -111,9 +111,9 @@ describe("ProgressScreen split Windows install progress", () => {
 
   it.each([1, 2, 3, 4] as const)("shows the active dual-client stage %i and only its own progress", (step) => {
     const extraction: DownloadProgress = { downloaded: 9, total: 10, source: WINDOWS_PORTABLE_EXTRACTION_SOURCE, phase: "applying" };
-    const task = [undefined, "正在准备 Python 和离线依赖…", "Windows 正在安装 Claude 系统服务…", "正在准备 Claude Code，并同步技能、模型和工具连接…"][step - 1];
-    const keys = [undefined, "offline.installActivity.runtime.python", "dual.stage.service", "dual.stage.models"];
-    const expected = [55, 25, 33, 50][step - 1];
+    const task = [undefined, "正在准备 Python 和离线依赖…", "Windows 正在安装 Claude 系统服务…", "正在准备 Claude Code，并同步技能和工具连接…"][step - 1];
+    const keys = [undefined, "offline.installActivity.runtime.python", "dual.stage.service", "dual.stage.connections"];
+    const expected = [55, 25, 33, 60][step - 1];
     renderInstall(step === 1 ? extraction : { ...extraction, phase: "finishing" }, extraction, null, step, task, keys[step - 1]);
     const bar = screen.getByTestId("install-progress-bar");
     expect(bar).toHaveAttribute("aria-valuenow", String(expected));

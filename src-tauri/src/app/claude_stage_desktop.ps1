@@ -6,6 +6,69 @@ $feed = 'https://update.404token.xyz/__codex_update__/claude/squirrel/'
 $bundled = @{desktop='6.28899.2.0';code='2.1.328';exe='997fa0850a14b1d428ce5aea52b47f329e17aa1b17c074a8d4f47c745009d7d0';archive='23e64dd91c09d522eb3571647e27efc40c174865ab5aa532d070d2ccb026c9a6'}
 $stage = $null
 $failure = 24
+$phase = 'prepare'
+function GetReleaseFile([string]$url,[string]$path,[string]$part) {
+    $file = [IO.File]::Open($path,'CreateNew','Write','None')
+    try {
+        $buffer = New-Object byte[] 131072
+        $total = -1L
+        $lastPercent = -1
+        $retries = 0
+        [Console]::Out.WriteLine("progress $part")
+        while ($total -lt 0 -or $file.Position -lt $total) {
+            $start = $file.Position
+            $end = $start + 16MB - 1
+            if ($total -ge 0) { $end = [Math]::Min($end, $total-1) }
+            $request = [Net.HttpWebRequest]::Create($url)
+            $request.AddRange([long]$start,[long]$end)
+            $response = $null
+            try {
+                $response = $request.GetResponse()
+                if ([int]$response.StatusCode -eq 206) {
+                    $range = $response.Headers['Content-Range']
+                    if ($range -notmatch '^bytes (\d+)-(\d+)/(\d+)$') { throw 'Invalid Content-Range' }
+                    $last = [long]$Matches[2]
+                    $size = [long]$Matches[3]
+                    if ([long]$Matches[1] -ne $start -or $last -lt $start -or $last -gt $end -or
+                        $size -le $last -or ($total -ge 0 -and $size -ne $total)) { throw 'Unexpected byte range' }
+                    $total = $size
+                } elseif ([int]$response.StatusCode -eq 200 -and $start -eq 0) {
+                    $total = $response.ContentLength
+                    $last = $total - 1
+                } else { throw 'Download resume not supported by relay' }
+                $inputStream = $response.GetResponseStream()
+                while ($true) {
+                    try { $n = $inputStream.Read($buffer,0,$buffer.Length) }
+                    catch [IO.IOException] { throw [IO.EndOfStreamException]::new('Network stream interrupted', $_.Exception) }
+                    if ($n -eq 0) { break }
+                    if ($total -ge 0 -and $file.Position+$n -gt $last+1) { throw 'Unexpected response length' }
+                    $file.Write($buffer,0,$n)
+                    if ($total -gt 0) {
+                        $percent = [int][Math]::Floor(100.0*$file.Position/$total)
+                        if ($percent -ne $lastPercent) {
+                            [Console]::Out.WriteLine("progress $part $percent")
+                            $lastPercent = $percent
+                        }
+                    }
+                }
+                if ($total -lt 0) { break }
+                if ($file.Position -ne $last+1) { throw [IO.EndOfStreamException]::new('Incomplete response') }
+                $retries = 0
+            } catch {
+                $e = $_.Exception
+                while ($e -is [Management.Automation.RuntimeException] -and $e.InnerException) { $e = $e.InnerException }
+                $status = if ($e -is [Net.WebException] -and $e.Response) { [int]$e.Response.StatusCode } else { 0 }
+                $transient = $e -is [IO.EndOfStreamException] -or ($e -is [Net.WebException] -and
+                    ($status -in 408,429,500,502,503,504 -or $e.Status -in 'Timeout','ReceiveFailure','ConnectionClosed','ConnectFailure','KeepAliveFailure'))
+                if ($e -is [Net.WebException] -and $e.Response) { $e.Response.Dispose() }
+                if (!$transient -or $retries -ge 2) { throw }
+                $retries++
+                [Console]::Out.WriteLine("progress retry-$part")
+                Start-Sleep -Milliseconds (500*$retries)
+            } finally { if ($response) { $response.Dispose() } }
+        }
+    } finally { $file.Dispose() }
+}
 function AssertProtected($path) {
     $dir = Get-Item -Force -LiteralPath $path
     if (!$dir.PSIsContainer -or ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unexpected installation directory' }
@@ -91,12 +154,15 @@ try {
     $web=[Net.WebClient]::new()
     if ($isUpdate) {
         $failure=30
+        $phase='manifest'
+        [Console]::Out.WriteLine('progress manifest')
         $pair=$web.DownloadString($feed+'latest.json') | ConvertFrom-Json
     } else {$pair=$bundled}
     if ($pair.desktop -cnotmatch '^\d+\.\d+\.\d+\.0$' -or $pair.code -cnotmatch '^\d+\.\d+\.\d+$' -or
         $pair.exe -cnotmatch '^[a-f0-9]{64}$' -or $pair.archive -cnotmatch '^[a-f0-9]{64}$') {throw 'Invalid release'}
     $v=([version]$pair.desktop).ToString()
     if ($v -cne $pair.desktop -or [version]$v -lt [version]$bundled.desktop) {throw 'Invalid desktop version'}
+    if ($isUpdate -and $env:CAM_CLAUDE_EXPECTED_PAIR -and "$v/$($pair.code)" -cne $env:CAM_CLAUDE_EXPECTED_PAIR) {throw 'The release changed; check for updates again'}
     $dest=Join-Path $root $v
     $failure=31
     if (!(Test-Path -LiteralPath $dest)) {
@@ -105,12 +171,16 @@ try {
         $setup=Join-Path $stage 'desktop.exe'
         $archive=Join-Path $stage 'code.zst'
         if ($isUpdate) {
-            $web.DownloadFile($feed+$v+'/desktop.exe',$setup)
-            $web.DownloadFile($feed+$v+'/code.zst',$archive)
+            $phase='desktop'
+            GetReleaseFile ($feed+$v+'/desktop.exe') $setup $phase
+            $phase='code'
+            GetReleaseFile ($feed+$v+'/code.zst') $archive $phase
         } else {
             [IO.File]::Copy((Join-Path $env:CAM_CLAUDE_MEDIA 'Claude-6.28899.2-x64-offline.exe'),$setup)
             [IO.File]::Copy((Join-Path $env:CAM_CLAUDE_MEDIA 'claude-code-2.1.328-win32-x64.exe.zst'),$archive)
         }
+        $phase='verify'
+        if ($isUpdate) { [Console]::Out.WriteLine('progress verify') }
         VerifyFile $setup $pair.exe
         VerifyFile $archive $pair.archive
         $sig=Get-AuthenticodeSignature -LiteralPath $setup
@@ -119,6 +189,8 @@ try {
         if ($isUpdate -and ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch '^CN="Anthropic, PBC", O="Anthropic, PBC",')) {throw 'Unexpected installer publisher'}
         $tree=Join-Path $stage 'image'
         $app=Join-Path $tree 'app'
+        $phase='extract'
+        if ($isUpdate) { [Console]::Out.WriteLine('progress extract') }
         ExpandOfficialDesktop $setup $app $v
         $seed=Join-Path $app 'resources\preseed\claude-code'
         [void][IO.Directory]::CreateDirectory($seed)
@@ -131,7 +203,16 @@ try {
     Write-Output $v
     exit 0
 } catch {
-    [Console]::Error.WriteLine(('Claude deployment failed at line {0} ({1})' -f $_.InvocationInfo.ScriptLineNumber,$_.Exception.GetType().Name))
+    $e=$_.Exception
+    while ($e -is [Management.Automation.RuntimeException] -and $e.InnerException) { $e=$e.InnerException }
+    $reason=$e.GetType().Name
+    if ($e -is [Net.WebException]) {
+        $reason=$e.Status.ToString()
+        if ($e.Response) { $reason="HTTP $([int]$e.Response.StatusCode)" }
+    } elseif ($e -is [IO.IOException]) {
+        $reason="$reason (0x{0:X8})" -f $e.HResult
+    }
+    [Console]::Error.WriteLine(('Claude deployment failed at line {0} phase={1} reason={2}' -f $_.InvocationInfo.ScriptLineNumber,$phase,$reason))
     exit $failure
 } finally {
     if ($web) {$web.Dispose()}

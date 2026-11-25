@@ -66,17 +66,17 @@ if ($EnableMediaGeneration) {
 $arguments += @('-FeishuAuthMode', $FeishuAuthMode, '-FeishuDomain', $FeishuDomain)
 if (@($EnableSkills).Count -gt 0) {
     $arguments += '-EnableSkills'
-    $arguments += @($EnableSkills)
+    $arguments += ($EnableSkills -join ',')
 }
 if (@($EnabledApiServices).Count -gt 0) {
     $arguments += '-EnabledApiServices'
-    $arguments += @($EnabledApiServices)
+    $arguments += ($EnabledApiServices -join ',')
 }
 if (@($EnabledRemoteMcps).Count -gt 0) {
     $arguments += '-EnabledRemoteMcps'
-    $arguments += @($EnabledRemoteMcps)
+    $arguments += ($EnabledRemoteMcps -join ',')
 }
 
-$powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+$powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
 & $powershell @arguments
 exit $LASTEXITCODE

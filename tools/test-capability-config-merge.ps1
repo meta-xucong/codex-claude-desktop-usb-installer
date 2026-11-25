@@ -38,7 +38,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Fixture venv failed' }
 Copy-Item -LiteralPath (Join-Path $PackRoot 'mcp\start-media-generation-mcp.ps1') -Destination $bin
 Copy-Item -LiteralPath (Join-Path $PackRoot 'mcp\media-generation-mcp.py') -Destination $bin
 $wrapper = Join-Path $bin 'start-media-generation-mcp.ps1'
-$registeredPattern = '(?m)^\[mcp_servers\.media_generation\][ \t]*\r?\nenabled[ \t]*=[ \t]*true[ \t]*(?:#.*)?\r?$'
+$registrationHelper = Join-Path $PackRoot 'replace-pack-config.py'
 $preserved = @'
 model = "fixture-model"
 model_provider = "fixture-provider"
@@ -53,14 +53,19 @@ enabled = false
 $verifyPython = @'
 import pathlib,sys,tomllib
 p=pathlib.Path(sys.argv[1]); cfg=tomllib.loads(p.read_text(encoding='utf-8-sig'))
-assert cfg['mcp_servers']['media_generation']['enabled'] is True
+media = cfg['mcp_servers']['media_generation']
+assert media['enabled'] is True
+if sys.argv[3] == 'repair-registration':
+    import json,subprocess
+    report = json.loads(subprocess.check_output([media['command'], *media['args'], '-HealthCheck'], timeout=45))
+    assert report['runtimeStatus'] == report['protocolStatus'] == 'passed' and report['toolCount'] > 0
 if sys.argv[2]=='preserve':
     assert cfg['model']=='fixture-model' and cfg['model_provider']=='fixture-provider'
     assert cfg['desktop']['conversationDetailMode']=='STEPS_COMMANDS'
     assert cfg['mcp_servers']['user_local']=={'command':'fixture.exe','args':['keep']}
     assert cfg['plugins']['latex@openai-bundled']['enabled'] is False
 '@
-$cases = @('no-config','zero-byte','only-replaced-table','existing-settings','bom-crlf','repeat-install','invalid-toml','missing-fragment')
+$cases = @('no-config','zero-byte','only-replaced-table','existing-settings','bom-crlf','repeat-install','repair-registration','invalid-toml','missing-fragment')
 $rows = @()
 foreach ($case in $cases) {
     $caseRoot = Join-Path $fixture ($case + ' with spaces')
@@ -71,6 +76,11 @@ foreach ($case in $cases) {
     if ($case -eq 'only-replaced-table') { [IO.File]::WriteAllText($config, "[mcp_servers.media_generation]`nenabled = true`n", $utf8) }
     if ($case -in @('existing-settings','repeat-install','missing-fragment')) { [IO.File]::WriteAllText($config, $preserved, $utf8) }
     if ($case -eq 'bom-crlf') { [IO.File]::WriteAllText($config, $preserved.Replace("`r`n","`n").Replace("`n","`r`n"), [Text.UTF8Encoding]::new($true)) }
+    if ($case -eq 'repair-registration') {
+        $oldMedia = "[mcp_servers.media_generation]`ncommand = 'powershell.exe'`nargs = ['-File','old.ps1']`nenabled = true`n"
+        [IO.File]::WriteAllText($config, ($preserved + "`n" + $oldMedia), $utf8)
+        if ((& $PythonExe -B $registrationHelper --media-registration $config $wrapper) -ne 'wrapper-mismatch') { throw 'Missing recovery precondition' }
+    }
     if ($case -eq 'invalid-toml') { [IO.File]::WriteAllText($config, "model = [`n", $utf8) }
     $before = if(Test-Path -LiteralPath $config){[Convert]::ToBase64String([IO.File]::ReadAllBytes($config))}else{$null}
     $generated = Join-Path $caseRoot 'generated.toml'
@@ -90,12 +100,12 @@ foreach ($case in $cases) {
             $merge = $mergeText | ConvertFrom-Json
             if (-not $merge.merged) { throw 'Config did not merge' }
             $text = [IO.File]::ReadAllText($config)
-            if (-not [regex]::IsMatch($text,$registeredPattern)) { throw 'Media registration did not pass' }
+            if ((& $PythonExe -B $registrationHelper --media-registration $config $wrapper) -ne 'registered') { throw 'Media registration did not pass' }
             foreach($marker in @('# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1','# END CODEX-STARTER-KIT MANAGED CONFIG v1')) {
                 if ([regex]::Matches($text,'(?m)^'+[regex]::Escape($marker)+'\r?$').Count -ne 1) { throw 'Managed block count changed' }
             }
-            $mode = if($case -in @('existing-settings','bom-crlf','repeat-install')){'preserve'}else{'new'}
-            & $PythonExe -B -c $verifyPython $config $mode
+            $mode = if($case -in @('existing-settings','bom-crlf','repeat-install','repair-registration')){'preserve'}else{'new'}
+            & $PythonExe -B -c $verifyPython $config $mode $case
             if ($LASTEXITCODE -ne 0) { throw 'TOML or retained settings verification failed' }
         }
     } catch { $caught = $_ }

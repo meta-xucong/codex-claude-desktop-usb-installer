@@ -63,7 +63,7 @@ pub use portable::{
     install_portable_from_msix_with_observer, install_portable_from_msix_with_observer_options,
     install_portable_from_msix_with_observer_options_and_progress, installed_app_exe,
     installed_codex_launch_exe, installed_codex_launch_exe_for_usb_mode,
-    installed_usb_codex_launch_exe, purge_codex_user_data,
+    installed_usb_codex_launch_exe, purge_codex_user_data, purge_codex_user_data_with_recovery,
     remove_directory_all_with_retry, rename_directory_with_retry, uninstall_portable,
     validate_cleanup_path, PortableBoundary, PortableExtractionProgress, PortableFault,
     PortableInstallOptions, PortableInstallReport, PortableInstallStage, PortableUninstallReport,
@@ -103,7 +103,7 @@ pub use windows_process::{
     desktop_user_profile_paths_if_elevated, same_windows_path, DesktopUserEnvironmentPaths,
 };
 #[cfg(windows)]
-pub use windows_process::run_as_desktop_user;
+pub use windows_process::{run_as_desktop_user, run_in_desktop_job};
 
 pub const OPENAI_PACKAGE_IDENTITY: &str = "OpenAI.Codex";
 

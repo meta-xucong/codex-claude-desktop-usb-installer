@@ -332,10 +332,10 @@ function Invoke-WizardInstall([switch]$SkipConnections) {
         $installArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $installScript, '-FeishuAuthMode', $feishuAuthMode, '-FeishuDomain', $feishuDomain)
         if ($feishuEnabled) { $installArgs += '-EnableFeishu' } else { $installArgs += '-DisableFeishu' }
         if ($mediaGenerationEnabled) { $installArgs += '-EnableMediaGeneration' } else { $installArgs += '-DisableMediaGeneration' }
-        if ($enabledSkills.Count -gt 0) { $installArgs += '-EnableSkills'; $installArgs += @($enabledSkills.ToArray()) }
-        if ($enabledApiServices.Count -gt 0) { $installArgs += '-EnabledApiServices'; $installArgs += @($enabledApiServices.ToArray()) }
-        if ($enabledRemoteMcps.Count -gt 0) { $installArgs += '-EnabledRemoteMcps'; $installArgs += @($enabledRemoteMcps.ToArray()) }
-        $output = @(& powershell.exe @installArgs 2>&1)
+        if ($enabledSkills.Count -gt 0) { $installArgs += '-EnableSkills'; $installArgs += ($enabledSkills.ToArray() -join ',') }
+        if ($enabledApiServices.Count -gt 0) { $installArgs += '-EnabledApiServices'; $installArgs += ($enabledApiServices.ToArray() -join ',') }
+        if ($enabledRemoteMcps.Count -gt 0) { $installArgs += '-EnabledRemoteMcps'; $installArgs += ($enabledRemoteMcps.ToArray() -join ',') }
+        $output = @(& (Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe') @installArgs 2>&1)
         foreach ($line in $output) { Write-WizardStatus ([string]$line) }
         if ($LASTEXITCODE -ne 0) { throw "安装失败，退出码 $LASTEXITCODE。" }
         $readinessPath = Join-Path ([Environment]::GetEnvironmentVariable('USERPROFILE')) '.codex\codex-agent-kit\readiness.json'

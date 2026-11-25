@@ -1397,6 +1397,7 @@ fn add_failure(
     message: &str,
 ) -> crate::app::model_catalog::NativeModelCatalogActionReport {
     crate::app::model_catalog::NativeModelCatalogActionReport {
+        default_model: None,
         status: status.into(),
         model_ids: Vec::new(),
         restart_required: false,

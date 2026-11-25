@@ -580,6 +580,70 @@ pub(crate) fn declared_desktop_version(executable: &Path) -> Result<String, AppE
     Ok(discover_bundle(executable, None)?.manifest.codex_desktop_version)
 }
 
+/// Read the manifest and file metadata for display. No MSIX content is opened here.
+fn offline_payload_overview(
+    executable: &Path,
+    package_override: Option<&Path>,
+    expected_architecture: Option<&str>,
+) -> Result<(OfflineBundle, OfflinePayloadReport), AppError> {
+    let bundle = discover_bundle(executable, package_override)?;
+    validate_host_architecture(&bundle.manifest.architecture, expected_architecture)?;
+    validate_windows_requirement(&bundle.manifest.min_windows_build)?;
+
+    let metadata = fs::metadata(&bundle.payload_path)
+        .map_err(|error| engine_error(format!("读取离线 MSIX 信息失败: {error}")))?;
+    if metadata.len() != bundle.manifest.payload.size {
+        return Err(engine_error(format!(
+            "MSIX 大小不匹配（实际 {}，清单 {}）",
+            metadata.len(),
+            bundle.manifest.payload.size
+        )));
+    }
+    let file_name = bundle
+        .payload_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| engine_error("MSIX 文件名无效"))?
+        .to_string();
+    let architecture = normalized_architecture_name(&bundle.manifest.architecture)
+        .ok_or_else(|| engine_error("manifest architecture 无效"))?
+        .to_string();
+    // The root manifest tag records payload provenance and may be changed by
+    // the Codex payload hot-update channel (for example, `upstream-*`). The
+    // historical local-installer contract uses its own stable namespace. Do
+    // not pass the provenance tag into resolve_windows_local_package(), which
+    // intentionally returns `local-signed-*` for a verified local MSIX.
+    let release_tag = format!("local-signed-{}", bundle.manifest.codex_desktop_version);
+    let report = OfflinePayloadReport {
+        ready: true,
+        manifest_path: path_text(&bundle.manifest_path),
+        payload_path: path_text(&bundle.payload_path),
+        file_name,
+        size: metadata.len(),
+        sha256: bundle.manifest.payload.sha256.clone(),
+        hash_verified: false,
+        package_name: bundle.manifest.package_name.clone(),
+        package_version: bundle.manifest.package_version.clone().unwrap_or_default(),
+        codex_desktop_version: bundle.manifest.codex_desktop_version.clone(),
+        architecture,
+        min_windows_build: bundle.manifest.min_windows_build.clone(),
+        app_entry: None,
+        app_version_verified: false,
+        release_tag,
+        authenticode: None,
+        warning: None,
+    };
+    Ok((bundle, report))
+}
+
+pub(crate) fn preview_offline_payload(
+    executable: &Path,
+    expected_architecture: &str,
+) -> Result<OfflinePayloadReport, AppError> {
+    offline_payload_overview(executable, None, Some(expected_architecture)).map(|(_, report)| report)
+}
+
 /// Verify the bundle's manifest, hash, identity and application metadata.
 /// When `enforce_authenticode` is true, also verify the source file's
 /// Authenticode signature.  The production USB preflight passes false so a
@@ -591,20 +655,7 @@ pub fn probe_offline_payload(
     expected_architecture: Option<&str>,
     enforce_authenticode: bool,
 ) -> Result<OfflinePayloadReport, AppError> {
-    let bundle = discover_bundle(executable, package_override)?;
-    validate_manifest(&bundle.manifest)?;
-    validate_host_architecture(&bundle.manifest.architecture, expected_architecture)?;
-    let windows_build = validate_windows_requirement(&bundle.manifest.min_windows_build)?;
-
-    let metadata = fs::metadata(&bundle.payload_path)
-        .map_err(|error| engine_error(format!("读取离线 MSIX 信息失败: {error}")))?;
-    if metadata.len() != bundle.manifest.payload.size {
-        return Err(engine_error(format!(
-            "MSIX 大小不匹配（实际 {}，清单 {}）",
-            metadata.len(),
-            bundle.manifest.payload.size
-        )));
-    }
+    let (bundle, overview) = offline_payload_overview(executable, package_override, expected_architecture)?;
     let actual_hash = codex_win_engine::sha256_file(&bundle.payload_path)
         .map_err(|error| engine_error(format!("计算 MSIX SHA-256 失败: {error}")))?;
     if !actual_hash.eq_ignore_ascii_case(bundle.manifest.payload.sha256.trim()) {
@@ -665,51 +716,27 @@ pub fn probe_offline_payload(
         None
     };
 
-    let file_name = bundle
-        .payload_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| engine_error("MSIX 文件名无效"))?
-        .to_string();
-    let architecture = normalized_architecture_name(&bundle.manifest.architecture)
-        .ok_or_else(|| engine_error("manifest architecture 无效"))?
-        .to_string();
-    // The root manifest tag records payload provenance and may be changed by
-    // the Codex payload hot-update channel (for example, `upstream-*`). The
-    // historical local-installer contract uses its own stable namespace. Do
-    // not pass the provenance tag into resolve_windows_local_package(), which
-    // intentionally returns `local-signed-*` for a verified local MSIX.
-    let release_tag = format!("local-signed-{}", bundle.manifest.codex_desktop_version);
     let warning = if embedded_version.is_none() {
         Some(
             "未读取到 resources/app.asar 的应用版本；安装阶段仍会再次执行完整 MSIX 校验。"
                 .to_string(),
         )
-    } else if windows_build.is_none() {
+    } else if !cfg!(windows) {
         Some("当前不是 Windows 运行环境，未执行 Windows Build 检查。".to_string())
     } else {
         None
     };
 
     Ok(OfflinePayloadReport {
-        ready: true,
-        manifest_path: path_text(&bundle.manifest_path),
-        payload_path: path_text(&bundle.payload_path),
-        file_name,
-        size: metadata.len(),
         sha256: actual_hash,
         hash_verified: true,
         package_name: identity.name,
         package_version: identity.version,
-        codex_desktop_version: bundle.manifest.codex_desktop_version,
-        architecture,
-        min_windows_build: bundle.manifest.min_windows_build,
         app_entry,
         app_version_verified: embedded_version.is_some(),
-        release_tag,
         authenticode,
         warning,
+        ..overview
     })
 }
 
@@ -1247,6 +1274,14 @@ mod tests {
             report.authenticode.is_none(),
             "quick preflight must defer the expensive signature scan"
         );
+
+        let size = fs::metadata(&msix).unwrap().len() as usize;
+        fs::write(&msix, vec![0; size]).unwrap();
+        let preview = preview_offline_payload(&executable, "x64").unwrap();
+        assert!(!preview.hash_verified && !preview.app_version_verified && preview.app_entry.is_none());
+        assert_eq!(preview.codex_desktop_version, report.codex_desktop_version);
+        assert!(probe_offline_payload(&executable, None, Some("x64"), false).is_err());
+        assert!(stage_offline_payload(&executable, None, Some("x64"), true).is_err());
 
         let _ = fs::remove_dir_all(root);
     }

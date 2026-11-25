@@ -4,8 +4,8 @@ Upstream: https://github.com/farion1231/cc-switch
 Version: 4.0.20
 Commit: 85ad4969b3399500baaea9d46b1e08f87aba80e1
 Product patch: source-patches/ccswitch-usb-product-85ad4969.patch
-Patch SHA256: 75772FC4BFF2B65056802F13908CB8F0CC71875A43422F1DF9C0879BD1F1BC48
-EXE SHA256: AEE49956F9BC9ADBA495B4440ED12A3CE3EF6016129C4AB3231878D7C32174F8
+Patch SHA256: 9228C27A5456316998510FC4D1D20B7F53E3472E185D67E1DAA435838F0AC947
+EXE SHA256: 670A32B826032E0A6B4C78977C597AE7FDDAAA369EDFD3B4367D8555E15706B3
 Apply the complete audited product patch to the pinned upstream commit to reproduce this build.
 This product retains the upstream 4.x key-field writer and adds the USB handoff, isolated home and explicit model-selection contract.
 License: see LICENSE. 404TOKEN is a third-party service, not an OpenAI official endpoint.

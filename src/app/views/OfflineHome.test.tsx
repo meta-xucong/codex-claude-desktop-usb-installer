@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { listen } from "@tauri-apps/api/event";
@@ -23,6 +23,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       winInstallHistoricalRelease: vi.fn(),
       winLaunch: vi.fn(),
       usbClaudeStatus: vi.fn(),
+      usbClaudeCheckUpdate: vi.fn().mockResolvedValue({kind:"none"}),
       usbClaudeUpdate: vi.fn(),
       usbClaudePrepare: vi.fn(),
       usbClaudeOpen: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       gatewayModelProbe: vi.fn(),
       cancelGatewayModelProbe: vi.fn(),
       manageNativeModelCatalog: vi.fn(),
+      manageClaudeModels: vi.fn(),
       accountStatus: vi.fn(),
       accountLogin: vi.fn(),
       accountRefresh: vi.fn(),
@@ -128,6 +130,7 @@ describe("OfflineHome", () => {
   it("leaves the single-client edition free of Claude probes", async () => {
     renderView();
     await screen.findByText("安装包已准备好");
+    expect(api.offlinePayloadProbe).toHaveBeenCalledWith(undefined, true);
     expect(api.usbClaudeStatus).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: /Claude/ })).not.toBeInTheDocument();
   });
@@ -135,27 +138,69 @@ describe("OfflineHome", () => {
   const installedDual = { status: "managed", installed: USB_PORTABLE_CODEX,
     usbPayloadVersion: PAYLOAD.codexDesktopVersion, usbClaudeIncluded: true } as const;
 
-  it.each([[true, "Claude 桌面和 Code 已更新。"], [false, "Claude 暂无可用更新。"]] as const)(
-    "checks both desktops with one click when Codex is current (%s)", async (changed, message) => {
-      api.winStatus.mockResolvedValue(installedDual);
-      api.checkCodexPayloadUpdate.mockResolvedValue({ kind: "none" });
-      api.usbClaudeStatus.mockResolvedValue("ready");
-      api.usbClaudeUpdate.mockResolvedValue(changed);
-      renderView();
-      await userEvent.click(await screen.findByTestId("codex-payload-update"));
-      expect(await screen.findByText(message, { exact: false })).toBeVisible();
-      expect(api.usbClaudeUpdate).toHaveBeenCalledTimes(1);
-      expect(api.checkCodexPayloadUpdate).toHaveBeenCalledTimes(1);
+  it("keeps Claude transfer progress, failure detail and retry in the update sheet", async () => {
+    let emit!: (event: {payload: string}) => void;
+    vi.mocked(listen).mockImplementation(async (event, callback) => {
+      if (event === "claude-desktop://progress") emit = callback as typeof emit;
+      return () => {};
     });
-
-  it("still checks Claude when the independent Codex source is unavailable", async () => {
     api.winStatus.mockResolvedValue(installedDual);
-    api.checkCodexPayloadUpdate.mockResolvedValue({ kind: "unavailable", message: "Codex source unavailable" });
-    api.usbClaudeUpdate.mockResolvedValue(false);
+    api.checkCodexPayloadUpdate.mockResolvedValue({kind:"none"});
+    api.usbClaudeCheckUpdate.mockResolvedValue({kind:"available", currentVersion:"6.1", latestVersion:"6.2", codeVersion:"2.5", expected:"6.2/2.5"});
+    let fail!: (cause: unknown) => void;
+    api.usbClaudeUpdate.mockImplementationOnce(() => new Promise((_resolve, reject) => {fail = reject;})).mockResolvedValueOnce(true);
     renderView();
     await userEvent.click(await screen.findByTestId("codex-payload-update"));
-    await waitFor(() => expect(api.usbClaudeUpdate).toHaveBeenCalledTimes(1));
+    await userEvent.click(await screen.findByRole("button", {name:"更新 Claude"}));
+    act(() => emit({payload:"update:desktop 37"}));
+    expect(await screen.findByText(/正在下载 Claude 桌面安装包.*37%/)).toBeVisible();
+    await act(async () => fail({code:"claude_deployment", message:"下载 Claude 桌面安装包失败（HTTP 503）。"}));
+    const sheet = screen.getByRole("dialog");
+    expect(within(sheet).getByText(/HTTP 503/)).toBeVisible();
+    await userEvent.click(within(sheet).getByRole("button",{name:"重试"}));
+    expect(api.usbClaudeUpdate.mock.calls).toEqual([["6.2/2.5"],["6.2/2.5"]]);
+    expect(within(sheet).queryByText(/HTTP 503/)).toBeNull();
     expect(api.applyCodexPayloadUpdate).not.toHaveBeenCalled();
+  });
+
+  it.each(["none", "unavailable"] as const)("checks each app independently when Codex is %s", async kind => {
+    api.winStatus.mockResolvedValue(installedDual);
+    api.checkCodexPayloadUpdate.mockResolvedValue(kind === "none" ? {kind} : {kind, message:"Codex source unavailable"});
+    api.usbClaudeCheckUpdate.mockResolvedValue({kind:"available", currentVersion:"6.1", latestVersion:"6.2", codeVersion:"2.5", expected:"6.2/2.5"});
+    renderView();
+    await userEvent.click(await screen.findByTestId("codex-payload-update"));
+    const action = await screen.findByRole("button",{name:"更新 Claude"});
+    expect(screen.queryByRole("button",{name:"更新 Codex"})).toBeNull();
+    expect(api.usbClaudeUpdate).not.toHaveBeenCalled();
+    expect(api.usbClaudePrepare).not.toHaveBeenCalled();
+    await userEvent.click(action);
+    await waitFor(() => expect(api.usbClaudeUpdate).toHaveBeenCalledWith("6.2/2.5"));
+    expect(api.applyCodexPayloadUpdate).not.toHaveBeenCalled();
+  });
+
+  it("lets Claude update while the Codex check is still pending, then offers Codex separately", async () => {
+    api.winStatus.mockResolvedValue(installedDual);
+    let resolveCodex!: (value: Awaited<ReturnType<typeof managerApi.checkCodexPayloadUpdate>>) => void;
+    api.checkCodexPayloadUpdate.mockImplementationOnce(() => new Promise(resolve => { resolveCodex = resolve; }));
+    api.usbClaudeCheckUpdate.mockResolvedValue({kind:"available", currentVersion:"6.1", latestVersion:"6.2", codeVersion:"2.5", expected:"6.2/2.5"});
+    renderView();
+    await userEvent.click(await screen.findByTestId("codex-payload-update"));
+    await userEvent.click(await screen.findByRole("button",{name:"更新 Claude"}));
+    await waitFor(() => expect(api.usbClaudeUpdate).toHaveBeenCalledTimes(1));
+    await act(async () => resolveCodex({kind:"available",info:{channel:"codex",currentVersion:"1",latestVersion:"2",payload:{},requiresRestart:false,releaseNotes:null,sizeBytes:null}}));
+    expect(await screen.findByRole("button",{name:"更新 Codex"})).toBeVisible();
+    expect(api.applyCodexPayloadUpdate).not.toHaveBeenCalled();
+  });
+
+  it("reports two current apps without an update operation", async () => {
+    api.winStatus.mockResolvedValue(installedDual);
+    api.checkCodexPayloadUpdate.mockResolvedValue({kind:"none"});
+    api.usbClaudeCheckUpdate.mockResolvedValue({kind:"none"});
+    renderView();
+    await userEvent.click(await screen.findByTestId("codex-payload-update"));
+    expect(await screen.findByText("Claude 暂无可用更新。")).toBeVisible();
+    expect(screen.queryByRole("button",{name:/^更新 (Codex|Claude)$/})).toBeNull();
+    expect(api.usbClaudeUpdate).not.toHaveBeenCalled();
   });
 
   it("installs both clients once after the Codex account handoff", async () => {
@@ -174,10 +219,53 @@ describe("OfflineHome", () => {
     expect(api.winLaunch).not.toHaveBeenCalled();
   });
 
+  it("prepares Claude after account handoff even if media registration failed", async () => {
+    const pending = { required: true, ready: false, accountReady: true, capabilitiesReady: false,
+      conflict: false, message: "核心能力尚未准备完成" };
+    api.usbHostStatus.mockResolvedValue(pending);
+    api.usbClaudeStatus.mockResolvedValue("prepare");
+    api.usbClaudePrepare.mockImplementationOnce(async () => { api.usbClaudeStatus.mockResolvedValue("components-pending"); });
+    api.winStatus.mockResolvedValue({ status: "none", installed: null, usbClaudeIncluded: true });
+    api.winInstallHistoricalRelease.mockImplementationOnce(async () => {
+      api.winStatus.mockResolvedValue(installedDual);
+      return { success: true, message: "installed" } as never;
+    });
+    api.installCapabilityPack.mockRejectedValueOnce(new Error("fixture capability failure"));
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "一键安装 Codex 和 Claude" }));
+    const hint = await screen.findByText(/部分工具或技能待修复/);
+    expect(await screen.findByRole("button", { name: "启动 Claude" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled();
+    expect(api.usbClaudePrepare).toHaveBeenCalledTimes(1);
+    expect(api.installAndLaunchCcswitch.mock.invocationCallOrder[0]).toBeLessThan(api.usbClaudePrepare.mock.invocationCallOrder[0]);
+    await userEvent.click(within(hint).getByRole("button", { name: "组件修复" }));
+    expect(await screen.findByRole("button", { name: "安装 / 修复能力包" })).toBeEnabled();
+    expect(api.initializeUsbHost).not.toHaveBeenCalled();
+    expect(api.winInstallHistoricalRelease).toHaveBeenCalledTimes(1);
+    expect(api.usbClaudeOpen).not.toHaveBeenCalled();
+  });
+
+  it("offers Claude configuration on reopening a PC with incomplete components", async () => {
+    api.winStatus.mockResolvedValue(installedDual);
+    api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: true,
+      capabilitiesReady: false, conflict: false, message: "components" });
+    api.usbClaudeStatus.mockResolvedValue("prepare");
+    api.usbClaudePrepare.mockImplementationOnce(async () => { api.usbClaudeStatus.mockResolvedValue("components-pending"); });
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "完成 Claude 配置" }));
+    expect(await screen.findByRole("button", { name: "启动 Claude" })).toBeEnabled();
+    expect(api.usbHostStatus).toHaveBeenCalledWith({ overview: true });
+    expect(api.usbClaudePrepare).toHaveBeenCalledTimes(1);
+    expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
+    expect(api.initializeUsbHost).not.toHaveBeenCalled();
+  });
+
   it("prepares both clients without reinstalling the USB program on a new computer", async () => {
     api.winStatus.mockResolvedValue(installedDual);
     api.usbHostStatus.mockResolvedValue({ required: true, ready: false, accountReady: false,
       capabilitiesReady: false, conflict: false, message: "本机待初始化" });
+    api.initializeUsbHost.mockResolvedValue({ required: true, ready: false, accountReady: true,
+      capabilitiesReady: false, conflict: false, message: "components pending" });
     renderView();
     await userEvent.click(await screen.findByRole("button", { name: "在本机配置 Codex 和 Claude" }));
     await waitFor(() => expect(api.usbClaudePrepare).toHaveBeenCalledTimes(1));
@@ -185,6 +273,36 @@ describe("OfflineHome", () => {
     expect(api.winInstallHistoricalRelease).not.toHaveBeenCalled();
     expect(api.usbClaudeOpen).not.toHaveBeenCalled();
     expect(api.winLaunch).not.toHaveBeenCalled();
+  });
+
+  it("opens both installed desktops with failed components and clears the warning after repair", async () => {
+    const pending = { required: true, ready: false, accountReady: true, capabilitiesReady: false, conflict: false, message: "components" };
+    api.winStatus.mockResolvedValue(installedDual);
+    api.usbHostStatus.mockResolvedValue(pending);
+    api.usbClaudeStatus.mockResolvedValue("components-pending");
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "启动 Claude" }));
+    await userEvent.click(await screen.findByRole("button", { name: "启动 Codex" }));
+    expect(api.winLaunch).toHaveBeenCalledTimes(1);
+    expect(api.usbClaudeOpen).toHaveBeenCalledTimes(1);
+    const hint = await screen.findByText(/部分工具或技能待修复/);
+    await userEvent.click(within(hint).getByRole("button", { name: "组件修复" }));
+    const apply = await screen.findByRole("button", { name: "安装 / 修复能力包" });
+    const previous = api.installCapabilityPack.getMockImplementation()!;
+    api.installCapabilityPack.mockImplementationOnce(async (...args) => {
+      const result = await previous(...args);
+      api.usbHostStatus.mockResolvedValue({ ...pending, ready: true, capabilitiesReady: true });
+      api.usbClaudeStatus.mockResolvedValue("ready");
+      return result;
+    });
+    await userEvent.click(apply);
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    await userEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "关闭" }));
+    await waitFor(() => expect(screen.queryByText(/部分工具或技能待修复/)).toBeNull());
+    expect(screen.getByRole("button", { name: "启动 Codex" })).toBeEnabled();
+    expect(await screen.findByRole("button", { name: "启动 Claude" })).toBeEnabled();
+    expect(api.usbClaudePrepare).not.toHaveBeenCalled();
+    expect(api.initializeUsbHost).not.toHaveBeenCalled();
   });
 
   it("launches only the selected client", async () => {
@@ -197,6 +315,10 @@ describe("OfflineHome", () => {
     expect(api.winLaunch).toHaveBeenCalledTimes(1);
     expect(api.usbClaudeOpen).toHaveBeenCalledTimes(1);
     expect(api.usbClaudePrepare).not.toHaveBeenCalled();
+    expect(api.manageClaudeModels).not.toHaveBeenCalled();
+    expect(api.manageNativeModelCatalog).not.toHaveBeenCalled();
+    expect(api.gatewayModelProbe).not.toHaveBeenCalled();
+    expect(api.mediaModelCatalog).not.toHaveBeenCalled();
   });
 
   it("keeps the installed program available when initializing a new PC fails", async () => {
@@ -216,7 +338,9 @@ describe("OfflineHome", () => {
   it("keeps Codex available and retries only the failed Claude setup", async () => {
     api.winStatus.mockResolvedValue(installedDual);
     api.usbClaudeStatus.mockResolvedValue("prepare");
-    api.usbClaudePrepare.mockRejectedValueOnce(new Error("fixture"));
+    api.usbClaudePrepare.mockRejectedValueOnce(new Error("fixture")).mockImplementationOnce(async () => {
+      api.usbClaudeStatus.mockResolvedValue("ready");
+    });
     renderView();
     await userEvent.click(await screen.findByRole("button", { name: "完成 Claude 配置" }));
     await userEvent.click(await screen.findByRole("button", { name: "重试 Claude" }));
@@ -247,7 +371,7 @@ describe("OfflineHome", () => {
       cancellable: false, interruptible: false } as never);
     renderView();
     const bar = await screen.findByTestId("install-progress-bar");
-    expect(bar).toHaveAttribute("aria-valuenow", "66");
+    expect(bar).toHaveAttribute("aria-valuenow", "60");
     expect(bar.querySelectorAll('[data-state="complete"]')).toHaveLength(3);
     expect(screen.getByText("正在同步 Claude 工具连接")).toBeVisible();
     expect(api.usbClaudePrepare).not.toHaveBeenCalled();
@@ -266,7 +390,7 @@ describe("OfflineHome", () => {
     renderView();
     const bar = await screen.findByTestId("install-progress-bar");
     expect(bar).toHaveAttribute("aria-valuenow", "66");
-    for (const [stage, percent] of [["runtime", 0], ["models", 50], ["finalize", 83], ["complete", 100]] as const) {
+    for (const [stage, percent] of [["runtime", 0], ["skills", 40], ["connections", 60], ["finalize", 80], ["complete", 100]] as const) {
       emit!({ payload: stage });
       await waitFor(() => expect(bar).toHaveAttribute("aria-valuenow", String(percent)));
       expect(bar.querySelectorAll('[data-state="complete"]')).toHaveLength(3);
@@ -715,7 +839,13 @@ describe("OfflineHome", () => {
     expect(screen.getByTestId("usb-guard-status")).toHaveTextContent("正在重新核验 U 盘");
   });
 
-  it.each([false, true])("redeploys the signed update and handles the included desktops (dual=%s)", async (dual) => {
+  it.each([
+    {dual: false, existing: false, hostReady: true, deploys: true},
+    {dual: true, existing: false, hostReady: false, deploys: true},
+    {dual: true, existing: true, hostReady: true, deploys: true},
+    {dual: true, existing: true, hostReady: false, deploys: true},
+    {dual: true, existing: true, hostReady: true, deploys: false},
+  ])("updates the Codex program independently of host setup (%o)", async ({dual, existing, hostReady, deploys}) => {
     const user = userEvent.setup();
     const nextPayload: OfflinePayloadReport = {
       ...PAYLOAD,
@@ -742,22 +872,25 @@ describe("OfflineHome", () => {
     api.checkCodexPayloadUpdate.mockResolvedValue({ kind: "available", info: updateInfo });
     api.offlinePayloadProbe.mockResolvedValueOnce(PAYLOAD).mockResolvedValue(nextPayload);
     api.offlinePayloadStage.mockResolvedValue(nextStage);
-    api.winStatus
-      .mockResolvedValueOnce({ installed: null, status: "none", usbClaudeIncluded: dual })
-      .mockResolvedValueOnce({ installed: null, status: "none", usbClaudeIncluded: dual })
-      .mockResolvedValue({
-        status: "managed",
-        installed: { ...USB_PORTABLE_CODEX, version: nextPayload.codexDesktopVersion },
-        usbClaudeIncluded: dual,
-      });
+    api.usbHostStatus.mockResolvedValue({required:true, ready:hostReady, accountReady:true,
+      capabilitiesReady:hostReady, conflict:false, message:hostReady ? "ready" : "核心能力尚未准备完成"});
+    api.winStatus.mockResolvedValue(existing ? {...installedDual, usbPayloadVersion: undefined} : {installed:null, status:"none", usbClaudeIncluded:dual});
+    api.winInstallHistoricalRelease.mockImplementationOnce(async () => {
+      if (deploys) api.winStatus.mockResolvedValue({...installedDual, usbClaudeIncluded:dual,
+        installed:{...USB_PORTABLE_CODEX, version:nextPayload.codexDesktopVersion}});
+      return {success:deploys, message:deploys ? "installed" : "fixture deployment failure"} as never;
+    });
+    if (!hostReady) api.installCapabilityPack.mockRejectedValue(new Error("fixture registration failure"));
 
     renderView();
-    const update = await screen.findByRole("button", { name: "检查并安装更新" });
+    if (dual) api.usbClaudeCheckUpdate.mockRejectedValueOnce(new Error("Claude source unavailable"));
+    const update = await screen.findByTestId("codex-payload-update");
     expect(update).toBeEnabled();
     await user.click(update);
-    expect(await screen.findByRole("heading", { name: dual ? "更新 Codex 到 26.700.1 并检查 Claude 更新？" : "更新 Codex 到 26.700.1？" })).toBeInTheDocument();
+    if (dual) await waitFor(() => expect(api.usbClaudeCheckUpdate).toHaveBeenCalledTimes(1));
+    else expect(await screen.findByRole("heading", {name:"更新 Codex 到 26.700.1？"})).toBeVisible();
     expect(api.usbClaudeUpdate).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("button", { name: /^更新$/ }));
+    await user.click(await screen.findByRole("button", {name: dual ? "更新 Codex" : /^更新$/}));
 
     await waitFor(() => expect(api.checkCodexPayloadUpdate).toHaveBeenCalledTimes(1));
     expect(api.applyCodexPayloadUpdate).toHaveBeenCalledWith(updateInfo);
@@ -766,8 +899,16 @@ describe("OfflineHome", () => {
       version: nextPayload.codexDesktopVersion,
       localPath: nextStage.stagedPath,
     });
-    expect(await screen.findByText("Codex 已更新到最新版。", { exact: false })).toBeInTheDocument();
-    await waitFor(() => expect(api.usbClaudeUpdate).toHaveBeenCalledTimes(dual ? 1 : 0));
+    const notice = !deploys ? /U 盘安装包已更新，但程序部署未完成/ : /Codex 已更新到最新版/;
+    expect((await screen.findAllByText(notice)).length).toBeGreaterThan(0);
+    if (deploys && !hostReady) {
+      expect(await screen.findByRole("button", {name:"启动 Codex"})).toBeEnabled();
+      expect(await screen.findByText(/部分工具或技能待修复/)).toBeVisible();
+    }
+    expect(api.installCapabilityPack).toHaveBeenCalledTimes(deploys && !existing ? 1 : 0);
+    expect(api.installAndLaunchCcswitch).toHaveBeenCalledTimes(deploys && !existing ? 1 : 0);
+    expect(api.usbClaudeUpdate).not.toHaveBeenCalled();
+    expect(api.usbClaudePrepare).not.toHaveBeenCalled();
   });
 
   it("does not report up to date when a payload source check is incomplete", async () => {
@@ -1342,6 +1483,14 @@ describe("OfflineHome", () => {
 
     expect(await screen.findByText(/部分运行时待修复/)).toBeInTheDocument();
     expect(screen.queryByText(/Codex 配置存在冲突\/需确认/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "组件修复" }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "关闭" }));
+    expect(screen.getByText(/部分运行时待修复/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "组件修复" }));
+    await user.click(await screen.findByRole("button", { name: "安装 / 修复能力包" }));
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(2));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "关闭" }));
+    expect(screen.queryByText(/部分运行时待修复/)).toBeNull();
   });
 
   it("keeps a quiet entry for capability repair and an independent CCSwitch retry", async () => {

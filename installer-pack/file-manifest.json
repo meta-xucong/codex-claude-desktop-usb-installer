@@ -13,8 +13,8 @@
     {
       "owned": true,
       "path": "Install-Codex-Starter.cmd",
-      "sha256": "fe7fa6d3fed9ac616380e787b35e02ef5310617caadaa5000eb2991bf9534728",
-      "bytes": 707
+      "sha256": "b59d37b216822f464f5f4fe5396dd2b57d08bedb0afd550f8dc9015a22f02d87",
+      "bytes": 801
     },
     {
       "owned": true,
@@ -67,8 +67,8 @@
     {
       "owned": true,
       "path": "audit-codex-compatibility.py",
-      "sha256": "3b7ce68650349d0a5fc468108e56706e306b9841813d12c9ca91220256585f3e",
-      "bytes": 65939
+      "sha256": "4a7988b2d063768445204d234df481e6308971d95e04a3036d22a6744abc1318",
+      "bytes": 66047
     },
     {
       "owned": true,
@@ -91,20 +91,20 @@
     {
       "owned": true,
       "path": "config-fragments/feishu-official-stdio.template.toml",
-      "sha256": "d3e33422e43b3331bf2124f108ff721f32b2ec2381aadb29522208a3350b78d4",
-      "bytes": 1564
+      "sha256": "66f65fb566723edd9a4244cad23311ac985cc00c45c9876c6a4127093b30f53f",
+      "bytes": 1570
     },
     {
       "owned": true,
       "path": "config-fragments/media-generation-stdio.template.toml",
-      "sha256": "e256d4d513304885a00f4496d994068edbb1c531ff82c8f506e61f8f9ff0622a",
-      "bytes": 754
+      "sha256": "ffa9d6610c01617fe245cf9e56e965d2a77a19bbb3de5842b393bd26389e6c5b",
+      "bytes": 760
     },
     {
       "owned": true,
       "path": "configure-codex.ps1",
-      "sha256": "47b1138267a76c37e14f683980e6a1209bd485013bc858a88e9c584271a92d93",
-      "bytes": 9712
+      "sha256": "70eb92041c0fa13286137f5b8149fb655ae68cb462320d194e0e1bf69a79779a",
+      "bytes": 10245
     },
     {
       "owned": true,
@@ -163,8 +163,8 @@
     {
       "owned": true,
       "path": "install-all.ps1",
-      "sha256": "000a5fa47918e68211b4fe5ccaae7c4056dc78081170d8c3ad15f3e424603cc6",
-      "bytes": 3192
+      "sha256": "64625105a9691d7c151be871851dd5d3465f273c3d53c0b35413dc26b2a284a9",
+      "bytes": 3248
     },
     {
       "owned": true,
@@ -175,14 +175,14 @@
     {
       "owned": true,
       "path": "install-to-codex.ps1",
-      "sha256": "9cb6d71ebe77e6e1e5fdc9cf097c42c8647b193b84f6c5cb6ca94c228fd4a3bf",
-      "bytes": 58206
+      "sha256": "12181be55261a12bd6d73428b4f7a622467c75755a439bfc99b18ab521d16511",
+      "bytes": 58787
     },
     {
       "owned": true,
       "path": "install-wizard.ps1",
-      "sha256": "b7573206c8bee5ec8c286245572c74798e3bbfb19a4b5b2f44ab2c0563251819",
-      "bytes": 30158
+      "sha256": "ae3557d9091a8814acf899010db475a11bccb2b636989a29223e0d1494de15f3",
+      "bytes": 30255
     },
     {
       "owned": true,
@@ -331,7 +331,7 @@
     {
       "owned": true,
       "path": "pack.json",
-      "sha256": "323f4158b4238dca07f34b93761a730fa781734b3040b8fc3366e7e056884075",
+      "sha256": "4285ab30a67ba2079d398f3feb8a2fb3c11eb3904a1975759f0069d3dffbceb7",
       "bytes": 4064
     },
     {
@@ -937,14 +937,14 @@
     {
       "owned": true,
       "path": "render-codex-config.ps1",
-      "sha256": "fad2c7caec924c590f7ed0d427c8a68185aa02765f12fc5fdcecff4226105dda",
-      "bytes": 16031
+      "sha256": "f94b5c9e8a75e7f1449be989d08e8e9a7923f0050614d46f4e41969f71c94adc",
+      "bytes": 16279
     },
     {
       "owned": true,
       "path": "replace-pack-config.py",
-      "sha256": "5fb7b5e542337025945b2ad5ca8cd5046c989e6c8063ccf181f2d7f31e3f5fce",
-      "bytes": 3291
+      "sha256": "07213a174b7c5e0d6112ba3eb8fb944762828dc8a69cabbdec7acb98c4ead9a0",
+      "bytes": 7831
     },
     {
       "owned": true,
@@ -1555,8 +1555,8 @@
     {
       "owned": true,
       "path": "runtime/provision-runtime.ps1",
-      "sha256": "a186440b9c5de1eef2be7b923d38faffff0eb54e839f272804781262dd1a5be9",
-      "bytes": 37454
+      "sha256": "7611417ffdeed6d50dbe8a364e843ceb63649133d39d92fc15042fde3b7523a3",
+      "bytes": 37655
     },
     {
       "owned": true,
@@ -3229,14 +3229,14 @@
     {
       "owned": true,
       "path": "sync-model-catalog.ps1",
-      "sha256": "22357bddfec3cdd68ba660c0a20c1d279463212e4825af1820fb478d104aa357",
-      "bytes": 13686
+      "sha256": "f73911c71ea4728deff9e9c8efeab1252c1233638b1e5ed99d47649978673f72",
+      "bytes": 13706
     },
     {
       "owned": true,
       "path": "test-adapter-contracts.py",
-      "sha256": "cda5f6d278af99cf248a60cc5df57800d1017426ab95948f00e0d9aaaa7f4ce1",
-      "bytes": 107815
+      "sha256": "8fdd7eb05f45237b85334e29e1c8b3dd18510cdde46b85d58cc0b58200fad473",
+      "bytes": 107853
     },
     {
       "owned": true,

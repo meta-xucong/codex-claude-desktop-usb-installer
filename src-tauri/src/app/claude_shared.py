@@ -117,8 +117,8 @@ def sync_skills(home, user, claude, state, config):
                     before, rest = raw.split("## 首次发现与只读能力检查", 1)
                     _, after = rest.split("## 可用 provider", 1)
                     data = (before + "## 首次发现与只读能力检查\n\n"
-                            "在 Claude Code 的 MCP 工具中查找 media_generation 的 media_capabilities，"
-                            "按工具声明用空参数查询。仅询问可用性时，到此结束。\n\n## 可用 provider" + after).encode()
+                            "查询当前会话的 mcp__media_generation__media_capabilities。若工具延迟加载，"
+                            "使用 ToolSearch 搜索该完整名称，再用空参数调用。仅询问可用性时，到此结束。\n\n## 可用 provider" + after).encode()
                 files[rel] = data
         sync_tree(claude / "skills" / name, snapshots / name, files)
 
@@ -127,42 +127,87 @@ def sync_skills(home, user, claude, state, config):
         sync_file(claude / "agents" / name, snapshots / name, docs.get(name))
 
 
-def sync_models(home, profile, state, config):
-    path = home / "codex-usb-native-model-catalog.json"
-    selected = []
-    if Path(config.get("model_catalog_json", "")) == path:
-        catalog = read_json(path)
-        if catalog.get("identity") != "404token-unified-api-internal":
-            raise ValueError("unknown model catalog")
-        selected = [row["slug"] for row in catalog["models"] if re.fullmatch(
-            r"(?:anthropic/)?claude-(?:sonnet|opus|haiku|fable)-[a-zA-Z0-9][\w.-]*", row["slug"])]
-    data = read_json(profile)
-    models = data["inferenceModels"]
+MODEL_FIELDS = ("inferenceModels", "modelDiscoveryEnabled")
+
+
+def model_name(row):
+    return row["name"] if isinstance(row, dict) else row
+
+
+def manage_models(profile, state, request):
     receipt = state / "models.json"
-    previous = read_json(receipt, [])
-    # Keep the first (default) model and any entries independently edited in Claude.
-    remaining = [model for i, model in enumerate(models) if i == 0 or model not in previous
-                 or model.get("name") in selected]
-    owned = [model for model in previous if model in remaining and model.get("name") in selected]
-    names = {model["name"] if isinstance(model, dict) else model for model in remaining}
-    for name in selected:
-        if name not in names:
-            remaining.append({"name": name})
-            owned.append({"name": name})
-            names.add(name)
-    if len(remaining) > 200:
-        raise ValueError("Claude model list is full")
-    if remaining != models:
-        latest = read_json(profile)
-        if latest.get("inferenceModels") != models or latest.get("inferenceCredentialHelper") != data.get("inferenceCredentialHelper"):
-            raise ValueError("Claude profile changed during sync")
-        pending = previous + [model for model in owned if model not in previous]
-        if pending != previous:
-            save(receipt, pending)
-        latest["inferenceModels"] = remaining
-        save(profile, latest)
-    if previous != owned or remaining != models:
+    data = read_json(profile)
+    actual = {k: data[k] for k in MODEL_FIELDS if k in data}
+    saved = read_json(receipt, [])
+    # Legacy receipts describe projected rows, never their original order/default.
+    owned = saved if isinstance(saved, dict) else {}
+    if "pending" in owned:
+        if actual == owned["pending"]:
+            owned["applied"] = actual
+        elif actual != owned["before"]:
+            raise ValueError("Claude model settings changed during save")
+        owned.pop("pending")
+        owned.pop("before")
         save(receipt, owned)
+    action = request["operation"]
+    if action == "reset":
+        if not owned:
+            return
+        original, applied = owned["original"], owned["applied"]
+        if actual == applied:
+            target = original
+        else:
+            target = dict(actual)
+            entries = actual.get("inferenceModels", [])
+            keep = [v for i, v in enumerate(entries) if i == 0 or v not in owned.get("added", [])]
+            # Undo our reorder only if the user retained our relative order.
+            old_rows = original.get("inferenceModels", [])
+            common = [v for v in applied.get("inferenceModels", []) if v in old_rows and v in keep]
+            if common and [v for v in keep if v in common] == common:
+                ordered = iter(v for v in old_rows if v in common)
+                keep = [next(ordered) if v in common else v for v in keep]
+            if keep != entries:
+                target["inferenceModels"] = keep
+    else:
+        chosen = request["model"]
+        rows = list(actual.get("inferenceModels") or [])
+        if not rows:
+            if action not in ("default", "add") or not isinstance(request.get("directory"), list):
+                raise ValueError("automatic model discovery needs a complete directory")
+            rows = list(request["directory"])
+        names = [model_name(row) for row in rows]
+        if chosen not in names:
+            if action != "add":
+                raise ValueError("model is not available")
+            rows.append(request["entry"])
+        elif action == "add":
+            return
+        if action == "default":
+            rows.insert(0, rows.pop(names.index(chosen)))
+        if len(rows) > 200:
+            raise ValueError("Claude model list is full")
+        target = dict(actual, inferenceModels=rows)
+        if not actual.get("inferenceModels") or "modelDiscoveryEnabled" not in actual and len(rows) == 1:
+            target["modelDiscoveryEnabled"] = False
+        if target == actual:
+            return
+        if not owned or owned.get("applied") != actual:
+            owned = {"original": actual, "applied": actual, "added": []}
+        if action == "add":
+            owned["added"].append(request["entry"])
+    latest = read_json(profile)
+    if {k: latest[k] for k in MODEL_FIELDS if k in latest} != actual or latest.get("inferenceCredentialHelper") != data.get("inferenceCredentialHelper"):
+        raise ValueError("Claude profile changed during save")
+    if target != actual:
+        save(receipt, dict(owned, before=actual, pending=target))
+        for k in MODEL_FIELDS:
+            latest.pop(k, None)
+        latest.update(target)
+        save(profile, latest)
+    if action == "reset":
+        receipt.unlink(missing_ok=True)
+    else:
+        save(receipt, dict(owned, applied=target))
 
 
 def server_definition(name, config, kit, bundle):
@@ -172,8 +217,11 @@ def server_definition(name, config, kit, bundle):
     wrapper = "start-media-generation-mcp.ps1" if name == "media_generation" else "start-feishu-mcp.ps1"
     args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(kit / "bin" / wrapper)]
     actual = entry.get("args", [])
+    command = entry.get("command")
+    system_shell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
     if (actual[:4] != args[:4] or len(actual) < 5 or Path(actual[4]) != Path(args[4])
-            or entry.get("command") != "powershell.exe" or entry.get("disabled_tools") or entry.get("env")):
+            or not isinstance(command, str) or (command != "powershell.exe" and Path(command) != system_shell)
+            or entry.get("disabled_tools") or entry.get("env")):
         raise ValueError("custom MCP registration")
     if name == "feishu":
         options = dict(zip(actual[5::2], actual[6::2], strict=True))
@@ -191,7 +239,7 @@ def server_definition(name, config, kit, bundle):
             raise ValueError("custom Feishu tool restrictions")
     if name == "media_generation" and (len(actual) != 5 or "enabled_tools" in entry):
         raise ValueError("custom media tool restrictions")
-    result = {"type": "stdio", "command": "powershell.exe", "args": args}
+    result = {"type": "stdio", "command": str(system_shell), "args": args}
     if name == "feishu":
         result["env"] = {"CODEX_USB_FEISHU_SETUP_ENTRY": str(bundle / "CodexEntryShim.exe")}
     return result
@@ -200,10 +248,26 @@ def server_definition(name, config, kit, bundle):
 def sync_servers(home, global_config, state, config, cli, bundle):
     receipt = state / "servers.json"
     owned = read_json(receipt, {})
-    for name in ("media_generation", "feishu"):
-        desired = server_definition(name, config, home / "codex-agent-kit", bundle)
+    kit = home / "codex-agent-kit"
+    desired_servers = {name: server_definition(name, config, kit, bundle)
+                       for name in ("media_generation", "feishu")}
+    for spec in read_json(kit / "manifest/mcp-servers.json")["servers"]:
+        if spec.get("transport") != "streamable-http":
+            continue
+        name = spec["id"]
+        entry = config.get("mcp_servers", {}).get(name, {})
+        desired_servers[name] = None
+        if entry and entry.get("enabled", True):
+            # Only project the manager's URL-only registration. OAuth is per client.
+            if entry.get("url") != spec["url"] or entry.keys() - {"url", "enabled"}:
+                raise ValueError(f"custom remote MCP registration: {name}")
+            desired_servers[name] = {"type": "http", "url": spec["url"]}
+    for name, desired in desired_servers.items():
         current = read_json(global_config, {}).get("mcpServers", {}).get(name)
         if current == desired:
+            if current is None and name in owned:
+                del owned[name]
+                save(receipt, owned)
             continue
         if current is not None and current != owned.get(name):
             if desired is not None:
@@ -224,20 +288,28 @@ def sync_servers(home, global_config, state, config, cli, bundle):
             run("add-json", name, json.dumps(desired, ensure_ascii=False))
             if read_json(global_config).get("mcpServers", {}).get(name) != desired:
                 raise ValueError("Claude did not retain the MCP registration")
+    # The model may only see ToolSearch before the per-server tools are requested.
+    claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path(os.environ["USERPROFILE"]) / ".claude")
+    rule = ("遇到图片或视频生成、编辑或媒体能力查询时，使用当前会话的 media_generation MCP。"
+            "若工具延迟加载，使用 ToolSearch 查找 mcp__media_generation__media_capabilities，"
+            "用空参数查询能力。按已启用的 image-2 或视频技能完成后续步骤，提交计费任务前须让用户确认。\n")
+    sync_file(claude / "rules/usb-media-tools.md", state / "rules/usb-media-tools.md",
+              rule.encode() if desired_servers["media_generation"] else None)
 
 
 def main():
     mode, cli, profile, directory = sys.argv[1:]
     state = Path(directory) / "shared"
     state.mkdir(parents=True, exist_ok=True)
+    if mode == "models":
+        manage_models(Path(profile), state, json.loads(os.environ.pop("CAM_CLAUDE_MODEL_REQUEST")))
+        return
     home = Path(os.environ["CAM_CLAUDE_CODEX_HOME"])
     user = Path(os.environ["USERPROFILE"])
     claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or user / ".claude")
     config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8-sig"))
     if mode in ("all", "skills"):
         sync_skills(home, user, claude, state, config)
-    if mode in ("all", "models"):
-        sync_models(home, Path(profile), state, config)
     if mode in ("all", "connections"):
         global_config = claude / ".claude.json" if os.environ.get("CLAUDE_CONFIG_DIR") else user / ".claude.json"
         sync_servers(home, global_config, state, config, cli, Path(os.environ["CAM_CLAUDE_MEDIA"]).parent.parent)

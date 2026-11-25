@@ -25,7 +25,7 @@ $source=[IO.File]::ReadAllText((Join-Path $repo 'installer-pack\runtime\provisio
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'Provisioner parse error'}
-foreach($name in @('Test-PathWithin','Assert-Media','ConvertTo-WindowsArgument','Stop-NativeProcessTree','Invoke-NativeCapture','Write-AsciiFile','Get-NodeVersion')){
+foreach($name in @('Test-PathWithin','Assert-Media','ConvertTo-WindowsArgument','Stop-NativeProcessTree','Invoke-NativeCapture','Write-AsciiFile','Get-NodeVersion','Expand-BundledZip')){
     $f=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true)
     . ([scriptblock]::Create($f.Extent.Text))
 }
@@ -40,7 +40,7 @@ $hyperframesFfmpegZip=Assert-Media $mediaManifest 'runtime.hyperframes-ffmpeg' $
 $hyperframesPackageFile=Assert-Media $mediaManifest 'runtime.hyperframes-package-json' $packRootFull
 $hyperframesLockFile=Assert-Media $mediaManifest 'runtime.hyperframes-package-lock' $packRootFull
 $hyperframesBrowserZip=Assert-Media $mediaManifest 'runtime.hyperframes-browser' $packRootFull
-$runtimeRoot=Join-Path $fixture 'codex-home\codex-agent-kit\runtime'
+$runtimeRoot=Join-Path (Join-Path $fixture ('u' * (137 - $fixture.Length))) 'runtime'
 New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
 $script:stages=[Collections.Generic.List[string]]::new()
 function Set-InstallProgress { param($Stage) $script:stages.Add($Stage); $env:USB_TEST_STAGE=$Stage; Write-Host $Stage }
@@ -51,11 +51,18 @@ $sharedEnd=$source.IndexOf('$hyperframesVersion =',$sharedStart)
 $setupWatch=[Diagnostics.Stopwatch]::StartNew()
 . ([scriptblock]::Create($source.Substring($sharedStart,$sharedEnd-$sharedStart)))
 # Inject interruption only in the test process. Preserve real EXEs from the
-# actual archives; all subsequent deployment uses the real Expand-Archive.
+# actual archives; subsequent deployment uses the production extractors.
 $script:injectInterruption=$InterruptComponent -ne 'none'
 $script:archiveCalls=[Collections.Generic.List[string]]::new()
+$realZipExtractor = (Get-Command Expand-BundledZip).ScriptBlock
+function Expand-BundledZip($Zip,$Destination) {
+    Invoke-TestExtraction $Zip $Destination -Bundled
+}
 function Expand-Archive {
     param($LiteralPath,$DestinationPath,[switch]$Force)
+    Invoke-TestExtraction $LiteralPath $DestinationPath
+}
+function Invoke-TestExtraction($LiteralPath,$DestinationPath,[switch]$Bundled) {
     $script:archiveCalls.Add([string]$LiteralPath)
     $isTarget=($InterruptComponent -eq 'encoder' -and $LiteralPath -eq $hyperframesFfmpegZip) -or ($InterruptComponent -eq 'browser' -and $LiteralPath -eq $hyperframesBrowserZip)
     if ($script:injectInterruption -and $isTarget) {
@@ -72,7 +79,8 @@ function Expand-Archive {
         } finally { $archive.Dispose() }
         throw "Injected extraction interruption after $InterruptComponent EXE files"
     }
-    Microsoft.PowerShell.Archive\Expand-Archive -LiteralPath $LiteralPath -DestinationPath $DestinationPath -Force:$Force
+    if ($Bundled) { & $realZipExtractor $LiteralPath $DestinationPath }
+    else { Microsoft.PowerShell.Archive\Expand-Archive -LiteralPath $LiteralPath -DestinationPath $DestinationPath -Force }
 }
 $env:HYPERFRAMES_BROWSER_PATH='fixture-caller-setting'
 $watch=[Diagnostics.Stopwatch]::StartNew()

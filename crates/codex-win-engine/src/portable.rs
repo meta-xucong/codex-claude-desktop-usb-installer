@@ -5676,10 +5676,23 @@ pub fn validate_cleanup_path(path: &Path) -> Result<(), EngineError> {
 /// keep a handle to an AppX cache for a short time after package removal, so
 /// use the same bounded retry primitive as portable installation cleanup and
 /// verify the postcondition before returning success.
-fn remove_user_data_path(path: &Path) -> Result<bool, EngineError> {
+fn remove_user_data_path(
+    path: &Path,
+    recover: Option<fn(&Path) -> Result<(), String>>,
+) -> Result<bool, EngineError> {
     validate_cleanup_path(path)?;
-    remove_path_with_retry("purge user data", path)
-        .map_err(|error| io_err("purge user data", error))
+    match remove_path_with_retry("purge user data", path) {
+        Ok(removed) => Ok(removed),
+        Err(error) => {
+            let detail = format!("清理用户目录 {} 失败：{error}", path.display());
+            if let Some(recover) = recover.filter(|_| is_transient_windows_fs_error(&error)) {
+                recover(path).map_err(|reason| EngineError::Io(format!("{detail}；{reason}")))?;
+                Ok(true)
+            } else {
+                Err(EngineError::Io(detail))
+            }
+        }
+    }
 }
 
 /// Remove the user's Codex data directories (sign-in, sessions, config and
@@ -5689,6 +5702,15 @@ fn remove_user_data_path(path: &Path) -> Result<bool, EngineError> {
 /// path that cannot be removed is surfaced so the UI cannot claim a clean
 /// uninstall and can offer a retry.
 pub fn purge_codex_user_data(notes: &mut Vec<String>) -> Result<bool, EngineError> {
+    purge_codex_user_data_with_recovery(notes, None)
+}
+
+/// A bundle may retry a blocked, explicitly selected tree using its existing
+/// handle-based remover. Target validation and the final absence check stay here.
+pub fn purge_codex_user_data_with_recovery(
+    notes: &mut Vec<String>,
+    recover: Option<fn(&Path) -> Result<(), String>>,
+) -> Result<bool, EngineError> {
     let paths = codex_user_data_paths()?;
     if paths.is_empty() {
         notes.push("User data purge requested but home directory was not available.".to_string());
@@ -5708,7 +5730,7 @@ pub fn purge_codex_user_data(notes: &mut Vec<String>) -> Result<bool, EngineErro
             }
         }
         log::warn!("purging Codex user data path={}", path.display());
-        if remove_user_data_path(&path)? {
+        if remove_user_data_path(&path, recover)? {
             removed_any = true;
             notes.push(format!("Removed Codex user data: {}", path.display()));
         }
@@ -8713,6 +8735,25 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn locked_profile_purge_reports_failure_then_succeeds_after_release() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = temp_test_dir("locked-profile-purge");
+        let profile = root.join("usb-codex-home");
+        fs::create_dir(&profile).unwrap();
+        let data = profile.join("logs.sqlite");
+        fs::write(&data, b"fixture").unwrap();
+        let handle = fs::OpenOptions::new().read(true).share_mode(1).open(&data).unwrap();
+        let error = remove_user_data_path(&profile, None).unwrap_err().to_string();
+        assert!(error.contains(&profile.display().to_string()));
+        assert!(data.is_file());
+        drop(handle);
+        assert!(remove_user_data_path(&profile, None).unwrap());
+        assert!(!remove_user_data_path(&profile, None).unwrap());
+        fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn user_data_purge_removes_known_profile_and_appx_paths_without_broad_wipe() {
         let _env_lock = test_env_lock();
@@ -8961,7 +9002,7 @@ if (Test-OwnedUsbShortcutForRepair $path $link $record) {{ throw 'custom argumen
             panic!("create test link: {error}");
         }
         assert!(validate_cleanup_path(&link.join("missing-child")).is_err());
-        assert!(remove_user_data_path(&link).is_err());
+        assert!(remove_user_data_path(&link, None).is_err());
         assert_eq!(
             fs::read(outside.join("keep.txt")).unwrap(),
             b"outside must survive"

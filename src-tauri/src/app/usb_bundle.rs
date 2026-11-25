@@ -128,16 +128,23 @@ fn relative_of(root: &Path, path: &Path) -> Result<String, AppError> {
 }
 
 fn ensure_inside(root: &Path, path: &Path) -> Result<PathBuf, AppError> {
-    let resolved = fs::canonicalize(path).map_err(|error| {
-        bundle_error(format!("无法解析 bundle 文件 {}：{error}", path.display()))
-    })?;
-    let root_resolved = fs::canonicalize(root).map_err(|error| {
+    ensure_inside_resolved(&canonical_bundle_root(root)?, path)
+}
+
+fn canonical_bundle_root(root: &Path) -> Result<PathBuf, AppError> {
+    fs::canonicalize(root).map_err(|error| {
         bundle_error(format!(
             "无法解析 bundle 根目录 {}：{error}",
             root.display()
         ))
+    })
+}
+
+fn ensure_inside_resolved(root_resolved: &Path, path: &Path) -> Result<PathBuf, AppError> {
+    let resolved = fs::canonicalize(path).map_err(|error| {
+        bundle_error(format!("无法解析 bundle 文件 {}：{error}", path.display()))
     })?;
-    if resolved != root_resolved && !resolved.starts_with(&root_resolved) {
+    if !resolved.starts_with(root_resolved) {
         return Err(bundle_error(format!(
             "bundle 文件不得逃逸根目录：{}",
             path.display()
@@ -333,15 +340,6 @@ fn read_sums_text(root: &Path) -> Result<String, AppError> {
         .map_err(|error| bundle_error(format!("{SUMS_FILE} 不是 UTF-8：{error}")))
 }
 
-fn listed_path(root: &Path, relative: &str) -> Result<PathBuf, AppError> {
-    let relative = relative_path(relative)?;
-    let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-    if !path.is_file() {
-        return Err(bundle_error(format!("SHA 清单文件不存在：{relative}")));
-    }
-    ensure_inside(root, &path)
-}
-
 fn is_mutable_runtime_path(relative: &str) -> bool {
     let lower = relative.to_ascii_lowercase();
     lower == "apps/codex"
@@ -469,6 +467,8 @@ fn install_only_input(relative: &str, payload_relative: &str) -> bool {
         relative,
         "resources/prerequisites/vc_redist.x64.exe"
             | "resources/prerequisites/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+            | "payload/claude/Claude-6.28899.2-x64-offline.exe"
+            | "payload/claude/claude-code-2.1.328-win32-x64.exe.zst"
     ) {
         return true;
     }
@@ -501,6 +501,7 @@ fn verify_sum_rows(
     metadata_snapshot: Option<(&[u8], &[u8])>,
     installed_launch: bool,
 ) -> Result<(usize, String, FileMetadataLedger), AppError> {
+    let root_resolved = canonical_bundle_root(root)?;
     let mut deferred = 0usize;
     let mut listed = HashSet::<String>::new();
     let mut ledger = FileMetadataLedger::new();
@@ -559,7 +560,10 @@ fn verify_sum_rows(
         let actual = if allowed_missing {
             expected.to_ascii_lowercase()
         } else {
-            let path = listed_path(root, &relative)?;
+            if !path.is_file() {
+                return Err(bundle_error(format!("SHA 清单文件不存在：{relative}")));
+            }
+            let path = ensure_inside_resolved(&root_resolved, &path)?;
             if installed_launch && install_only_input(&relative, payload_relative) {
                 deferred += 1;
                 // Compare signed manifest declarations below, not a claimed content verification.
@@ -1807,14 +1811,32 @@ mod tests {
     }
 
     #[test]
+    fn resolved_release_root_accepts_children_but_rejects_a_similarly_named_sibling() {
+        let fixture = std::env::temp_dir().join(format!("usb-path-boundary-{}", uuid::Uuid::new_v4()));
+        let root = fixture.join("release");
+        let sibling = fixture.join("release-old");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let resolved = canonical_bundle_root(&root).unwrap();
+        fs::write(root.join("payload"), b"valid").unwrap();
+        fs::write(sibling.join("payload"), b"other").unwrap();
+        assert!(ensure_inside_resolved(&resolved, &root.join("payload")).is_ok());
+        assert!(ensure_inside_resolved(&resolved, &sibling.join("payload")).is_err());
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     fn installed_open_defers_only_audited_deployment_inputs() {
         let root = std::env::temp_dir().join(format!("usb-open-{}", uuid::Uuid::new_v4()));
         let payload = "payload/OpenAI.Codex_x64.msix";
         let browser =
             "content/codex-starter-kit/runtime/bundled/chrome-headless-shell-152.0.7977.30-win64.zip";
         let unknown = "content/codex-starter-kit/runtime/bundled/unknown.zip";
+        let desktop = "payload/claude/Claude-6.28899.2-x64-offline.exe";
+        let code = "payload/claude/claude-code-2.1.328-win32-x64.exe.zst";
+        let worker = "payload/claude/claude-desktop-worker.ps1";
         let mut rows = String::new();
-        for name in [payload, browser, unknown, "CodexEntryShim.exe"] {
+        for name in [payload, browser, desktop, code, worker, unknown, "CodexEntryShim.exe"] {
             let path = root.join(name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, b"valid input").unwrap();
@@ -1837,14 +1859,15 @@ mod tests {
             payload
         ));
         let check = |launch| verify_sum_rows(&root, payload, None, &rows, None, launch);
-        assert_eq!(check(false).unwrap().0, 4);
-        for name in [payload, browser] {
+        assert!(!install_only_input("payload/claude/unlisted-version.exe", payload));
+        assert_eq!(check(false).unwrap().0, 7);
+        for name in [payload, browser, desktop, code] {
             fs::write(root.join(name), b"bad content").unwrap();
-            assert_eq!(check(true).unwrap().0, 2);
+            assert_eq!(check(true).unwrap().0, 3);
             assert!(check(false).unwrap_err().to_string().contains(name));
             fs::write(root.join(name), b"valid input").unwrap();
         }
-        for name in [unknown, "CodexEntryShim.exe"] {
+        for name in [worker, unknown, "CodexEntryShim.exe"] {
             fs::write(root.join(name), b"bad content").unwrap();
             assert!(check(true).unwrap_err().to_string().contains(name));
             fs::write(root.join(name), b"valid input").unwrap();

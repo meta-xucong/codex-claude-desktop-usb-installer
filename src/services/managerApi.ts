@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 
 import type {
@@ -1088,12 +1088,13 @@ export const managerApi = {
     });
   },
   /** Inspect the fixed manifest/MSIX next to the setup executable. */
-  offlinePayloadProbe(packagePath?: string): Promise<OfflinePayloadReport> {
+  offlinePayloadProbe(packagePath?: string, previewOnly = false): Promise<OfflinePayloadReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({ ...OFFLINE_FALLBACK_REPORT });
     }
     return invoke<OfflinePayloadReport>("offline_payload_probe", {
       packagePath: packagePath ?? null,
+      previewOnly,
     });
   },
   /** Check 404token reachability and the signed API-key binding before install. */
@@ -1492,6 +1493,12 @@ export const managerApi = {
       return Promise.resolve(null);
     }
     return invoke<UninstallHandoffStatus | null>("get_uninstall_handoff");
+  },
+  dismissUninstallProfileRetry(retryId: string): Promise<void> {
+    return invoke<void>("dismiss_uninstall_profile_retry", { retryId });
+  },
+  retryUninstallProfile(retryId: string): Promise<UninstallHandoffStatus> {
+    return invoke<UninstallHandoffStatus>("retry_uninstall_profile", { retryId, confirm: true });
   },
   completeUninstallHandoff(handoffId: string): Promise<void> {
     if (!hasTauriRuntime()) {
@@ -1959,10 +1966,10 @@ export const managerApi = {
     return invoke<WinInstallStatus>("win_adopt_path", { path });
   },
   // Open the installed Codex — explicit user action (mirrors macLaunch).
-  usbHostStatus(): Promise<UsbHostStatus> {
+  usbHostStatus(options?: { overview: boolean }): Promise<UsbHostStatus> {
     if (!hasTauriRuntime()) return Promise.resolve({ required: false, ready: true,
       accountReady: true, capabilitiesReady: true, conflict: false, message: "" });
-    return invoke<UsbHostStatus>("usb_host_status");
+    return invoke<UsbHostStatus>("usb_host_status", options);
   },
   initializeUsbHost(replaceAccount = false): Promise<UsbHostStatus> {
     if (!hasTauriRuntime()) return this.usbHostStatus();
@@ -1976,7 +1983,7 @@ export const managerApi = {
       ? invoke<void>("win_launch_codex", { locale })
       : invoke<void>("win_launch_codex");
   },
-  usbClaudeStatus(): Promise<"install" | "prepare" | "recover" | "ready"> {
+  usbClaudeStatus(): Promise<"install" | "prepare" | "recover" | "ready" | "components-pending"> {
     return invoke("usb_claude_status");
   },
   usbClaudeOpen(): Promise<void> {
@@ -1985,11 +1992,21 @@ export const managerApi = {
   usbClaudePrepare(): Promise<void> {
     return invoke("usb_claude_prepare");
   },
-  usbClaudeSyncSkills(): Promise<void> {
-    return invoke("usb_claude_sync_skills");
+  manageClaudeModels(operation: "state" | "refresh" | "add" | "default" | "reset", model?: string, binding?: string, progress?: (stage: "probing" | "saving") => void) {
+    const onStage = progress ? new Channel(progress) : undefined;
+    return invoke<{ ready: boolean; binding: string; configured: string[]; native?: string[]; directory: string[] }>("manage_claude_models", { operation, model, binding, onStage });
   },
-  usbClaudeUpdate(): Promise<boolean> {
-    return invoke("usb_claude_update");
+  testClaudeModel(model: string, binding: string) {
+    return invoke<{ ready: boolean; probeError?: string | null }>("manage_claude_models", { operation: "test", model, binding });
+  },
+  usbClaudeSyncSkills(scope?: "connections" | "capabilities"): Promise<"synced" | "pending" | "not_applicable"> {
+    return scope ? invoke("usb_claude_sync_skills", { scope }) : invoke("usb_claude_sync_skills");
+  },
+  usbClaudeCheckUpdate() {
+    return invoke<{ kind: "none" | "notInstalled" | "recover" } | { kind: "available"; currentVersion: string; latestVersion: string; codeVersion: string; expected: string }>("usb_claude_check_update");
+  },
+  usbClaudeUpdate(expected: string): Promise<boolean> {
+    return invoke("usb_claude_update", { expected });
   },
   /** Launch the bundled Codex Switch configurator (USB-direct in the offline bundle). */
   installAndLaunchCcswitch(): Promise<CcswitchLaunchReport> {
@@ -2093,7 +2110,7 @@ export const managerApi = {
     return invoke<AccountStatus>("account_redeem", { code });
   },
   /** Inspect the bundled offline Skills/MCP/Agents capability pack. */
-  capabilityPackStatus(): Promise<CapabilityPackReport> {
+  capabilityPackStatus(includeConnections = false): Promise<CapabilityPackReport> {
     if (!hasTauriRuntime()) {
       return Promise.resolve({
         available: false,
@@ -2122,7 +2139,7 @@ export const managerApi = {
         message: "browser preview: capability pack status is unavailable",
       });
     }
-    return invoke<CapabilityPackReport>("capability_pack_status");
+    return includeConnections ? invoke<CapabilityPackReport>("capability_pack_status", { includeConnections }) : invoke<CapabilityPackReport>("capability_pack_status");
   },
   /** Install or repair the complete offline capability pack. */
   installCapabilityPack(

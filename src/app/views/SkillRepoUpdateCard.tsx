@@ -224,6 +224,7 @@ function rollbackTone(
 
 export function SkillRepoUpdateCard({ dualEdition = false }: { dualEdition?: boolean } = {}) {
   const { t } = useI18n();
+  const [syncStatus, setSyncStatus] = useState<"pending" | "synced" | null>(null);
   const busyRef = useRef<BusyAction>(null);
   const [busy, setBusy] = useState<BusyAction>(null);
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
@@ -254,8 +255,10 @@ export function SkillRepoUpdateCard({ dualEdition = false }: { dualEdition?: boo
 
   const syncClaude = async () => {
     if (!dualEdition) return;
+    setSyncStatus(null);
     try {
-      await managerApi.usbClaudeSyncSkills();
+      const status = await managerApi.usbClaudeSyncSkills();
+      setSyncStatus(status === "pending" ? "pending" : status === "synced" ? "synced" : null);
       setRetryAction(null);
     } catch (cause) {
       setFailure({ ...resolveFailure(cause, t, { sanitizeDetail: true }), message: t("dual.skillsPending") });
@@ -432,9 +435,10 @@ export function SkillRepoUpdateCard({ dualEdition = false }: { dualEdition?: boo
             <h3 id={titleId}>{t("skillRepo.title")}</h3>
           </div>
           <p id={bodyId} className="skill-repo-sheet-description">
-            {t("skillRepo.description")}
+            {t(dualEdition ? "dual.skillHub" : "skillRepo.description")}
           </p>
 
+          {syncStatus && <p role="status">{t(syncStatus === "pending" ? "dual.syncWaiting" : "dual.syncDone")}</p>}
           <div className="skill-repo-sheet-actions">
             <button type="button" className="btn primary" onClick={() => void check()} disabled={busy !== null}>
               {busy === "check" ? t("skillRepo.checking") : busy === "apply" ? t("skillRepo.updating") : t("skillRepo.check")}

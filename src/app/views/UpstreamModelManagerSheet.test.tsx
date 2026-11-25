@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -18,6 +18,8 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       gatewayModelProbe: vi.fn(),
       cancelGatewayModelProbe: vi.fn(),
       manageNativeModelCatalog: vi.fn(),
+      manageClaudeModels: vi.fn(),
+      testClaudeModel: vi.fn(),
     },
   };
 });
@@ -125,21 +127,118 @@ describe("UpstreamModelManagerSheet direct add flow", () => {
     expect(api.manageNativeModelCatalog).not.toHaveBeenCalledWith(expect.objectContaining({ operation: "add" }));
   });
 
-  it("finishes a partial dual-client add from the same button without another paid probe", async () => {
-    const model = "claude-sonnet-4-6";
-    api.gatewayModelProbe.mockResolvedValue({ ...listing, models: [{ id: model, ownedBy: "fixture", selectable: true }] });
-    let prepareCount = 0;
+  it("keeps local model membership when the upstream directory rejects", async () => {
+    api.manageNativeModelCatalog.mockResolvedValue({...added, status:"ok"});
+    api.gatewayModelProbe.mockRejectedValue(new Error("offline"));
+    renderSheet(true);
+    const row = await screen.findByTestId("upstream-model-configured-only-vendor/model-latest");
+    expect(within(row).getByText("已添加到 Codex")).toBeInTheDocument();
+    expect(within(row).queryByRole("button",{name:"探测并添加"})).toBeNull();
+  });
+
+  it("loads Claude on demand and keeps model operations on the selected client", async () => {
+    const user = userEvent.setup();
+    const model = "claude-sonnet-5";
+    const view = { ready: true, binding: "fixture", configured: [] as string[], native: ["claude-haiku-5-5", model], directory: ["claude-haiku-5-5", model, "gateway/other"] };
+    api.manageClaudeModels.mockImplementation(async op => op === "default" ? { ...view, configured: [model, "claude-haiku-5-5"] } : view);
+    renderSheet(true);
+    await screen.findByTestId("upstream-model-vendor/model-latest");
+    expect(api.manageClaudeModels).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Claude Code" }));
+    const row = await screen.findByTestId("claude-model-" + model);
+    expect(within(row).getByText("已添加到 Claude Code")).toBeVisible();
+    expect(within(row).queryByRole("button", {name:"探测并添加"})).toBeNull();
+    expect(within(screen.getByTestId("claude-model-gateway/other")).getByRole("button", {name:"探测并添加"})).toBeVisible();
+    const pin = await screen.findAllByRole("button", { name: "设为默认" });
+    await user.click(pin.find(button => button.closest("li")?.textContent?.includes(model))!);
+    expect(api.manageClaudeModels).toHaveBeenCalledWith("default", model, "fixture");
+    await user.click(screen.getByRole("button", { name: "Codex" }));
+    await user.click(screen.getByRole("button", { name: "Claude Code" }));
+    expect(api.manageClaudeModels.mock.calls.map(c => c[0])).toEqual(["state", "refresh", "default"]);
+    expect(api.manageNativeModelCatalog.mock.calls.every(([r]) => r.operation === "state")).toBe(true);
+    expect(api.gatewayModelProbe).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a newly added Claude model on reopen without probing it twice", async () => {
+    const user = userEvent.setup();
+    const model = "gateway/additional";
+    const native = ["claude-sonnet", "claude-sonnet[1m]"];
+    let configured: string[] = [];
+    api.manageClaudeModels.mockImplementation(async (operation) => {
+      if (operation === "add") configured = [...native, model];
+      return { ready: true, binding: "fixture", configured, native, directory: [...native, model] };
+    });
+    const first = renderSheet(true);
+    await user.click(await screen.findByRole("button", { name: "Claude Code" }));
+    const row = await screen.findByTestId("claude-model-" + model);
+    await user.click(await within(row).findByRole("button", { name: "探测并添加" }));
+    expect(await within(row).findByText("已添加到 Claude Code")).toBeVisible();
+    first.unmount();
+    renderSheet(true);
+    await user.click(await screen.findByRole("button", { name: "Claude Code" }));
+    const reopened = await screen.findByTestId("claude-model-" + model);
+    expect(within(reopened).getByText("已添加到 Claude Code")).toBeVisible();
+    expect(within(reopened).queryByRole("button", { name: "探测并添加" })).toBeNull();
+    expect(api.manageClaudeModels.mock.calls.filter(([op]) => op === "add")).toEqual([["add", model, "fixture", expect.any(Function)]]);
+    expect(api.manageNativeModelCatalog.mock.calls.every(([req]) => req.operation === "state")).toBe(true);
+  });
+
+  it("shows the actual Claude probe and save phases, and retries the failed row", async () => {
+    const user = userEvent.setup();
+    const model = "gemini-4-neon";
+    const view = {ready:true, binding:"fixture", configured:["native"], directory:["native", model]};
+    let fail!: (error: Error) => void;
+    let done!: (result: typeof view) => void;
+    let progress!: (stage: "probing" | "saving") => void;
+    api.manageClaudeModels.mockImplementation(async (op, _id, _binding, stage) => {
+      if (op !== "add") return view;
+      progress = stage!;
+      return new Promise((resolve, reject) => {done = resolve; fail = reject;});
+    });
+    renderSheet(true);
+    await user.click(await screen.findByRole("button",{name:"Claude Code"}));
+    const row = await screen.findByTestId("claude-model-"+model);
+    await user.click(within(row).getByRole("button",{name:"探测并添加"}));
+    expect(within(row).getByRole("button",{name:"正在准备探测…"})).toBeDisabled();
+    act(() => progress("probing"));
+    expect(within(row).getByRole("button",{name:"正在测试…"})).toBeDisabled();
+    await act(async () => fail(new Error("网关限流（HTTP 429）。")));
+    expect(within(row).getByText(/HTTP 429/)).toBeVisible();
+    await user.click(within(row).getByRole("button",{name:"重新检测"}));
+    act(() => progress("saving"));
+    expect(within(row).getByRole("button",{name:"正在保存…"})).toBeDisabled();
+    await act(async () => done({...view, configured:["native",model]}));
+    expect(within(row).getByText("已添加到 Claude Code")).toBeVisible();
+    act(() => progress("saving")); // Late IPC delivery after the command completed.
+    expect(within(row).getByText("已添加到 Claude Code")).toBeVisible();
+    expect(within(row).queryByText(/HTTP 429/)).toBeNull();
+    expect(within(row).queryByRole("button",{name:"探测并添加"})).toBeNull();
+    expect(api.manageNativeModelCatalog.mock.calls.every(([r]) => r.operation === "state")).toBe(true);
+  });
+
+  it("asks before testing the Claude directory and never writes during a bulk test", async () => {
+    const user = userEvent.setup();
+    api.manageClaudeModels.mockResolvedValue({ready:true,binding:"fixture",configured:[],directory:["one","two"]});
+    api.testClaudeModel.mockResolvedValueOnce({ready:true,probeError:null}).mockResolvedValueOnce({ready:true,probeError:"HTTP 403"});
+    renderSheet(true);
+    await user.click(await screen.findByRole("button",{name:"Claude Code"}));
+    await screen.findByTestId("claude-model-two");
+    await user.click(screen.getByRole("button",{name:"测所有模型可用性"}));
+    expect(api.testClaudeModel).not.toHaveBeenCalled();
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button",{name:"开始测试"}));
+    expect(await within(screen.getByTestId("claude-model-two")).findByText("HTTP 403")).toBeVisible();
+    expect(api.testClaudeModel.mock.calls).toEqual([["one","fixture"],["two","fixture"]]);
+    expect(api.manageClaudeModels.mock.calls.every(([op]) => ["state","refresh"].includes(op))).toBe(true);
+  });
+
+  it("reports a non-Claude model as added only to Codex in the dual edition", async () => {
     api.manageNativeModelCatalog.mockImplementation(async ({ operation }) => ({
-      ...ready, modelIds: [model], status: operation === "state" ? "ok" : "already_added",
-      errorCode: operation === "prepare" && ++prepareCount === 1 ? "claude-sync-pending" : undefined,
+      ...ready, modelIds: [], status: operation === "state" ? "ok" : "already_added",
     }));
     renderSheet(true);
-    const user = userEvent.setup();
-    await clickProbeAndAdd(user);
-    await screen.findByText("Codex 的模型列表已保存。Claude 尚未同步，请重试刚才的操作。");
-    await clickProbeAndAdd(user);
-    await screen.findByText("模型列表已更新，重新打开对应应用后可选择。");
-    expect(api.gatewayModelProbe.mock.calls.every(([request]) => !request.reasoningModelId)).toBe(true);
+    await clickProbeAndAdd(userEvent.setup());
+    await screen.findByText("这个模型已在 Codex 目录中。");
+    expect(screen.queryByText("模型列表已更新，重新打开对应应用后可选择。")).toBeNull();
   });
 
   it("probes the full supported effort set and automatically adds after any accepted result", async () => {
@@ -165,7 +264,7 @@ describe("UpstreamModelManagerSheet direct add flow", () => {
       reasoningCostConsent: true,
     });
     expect(confirmSpy).not.toHaveBeenCalled();
-    expect(await screen.findByText("已添加到 Codex")).toBeInTheDocument();
+    expect(await within(screen.getByTestId("upstream-model-vendor/model-latest")).findByText("已添加到 Codex")).toBeInTheDocument();
     expect(screen.getByTestId("upstream-model-vendor/model-latest")).toBeInTheDocument();
   });
 
@@ -182,7 +281,7 @@ describe("UpstreamModelManagerSheet direct add flow", () => {
     await clickProbeAndAdd(user);
 
     await waitFor(() => expect(api.manageNativeModelCatalog).toHaveBeenCalledWith(expect.objectContaining({ operation: "add" })));
-    expect(await screen.findByText("已添加到 Codex")).toBeInTheDocument();
+    expect(await within(screen.getByTestId("upstream-model-vendor/model-latest")).findByText("已添加到 Codex")).toBeInTheDocument();
   });
 
   it("omits none for Claude Opus 5.5 before sending the reasoning probe", async () => {
@@ -229,7 +328,7 @@ describe("UpstreamModelManagerSheet direct add flow", () => {
     await waitFor(() => expect(addAttempts).toBe(4));
     expect(api.gatewayModelProbe).toHaveBeenCalledTimes(2);
     expect(api.manageNativeModelCatalog).toHaveBeenCalledTimes(6);
-    expect(await screen.findByText("已添加到 Codex")).toBeInTheDocument();
+    expect(await within(screen.getByTestId("upstream-model-vendor/model-latest")).findByText("已添加到 Codex")).toBeInTheDocument();
   });
 
   it("does not add when no effort was explicitly accepted", async () => {
@@ -269,7 +368,7 @@ describe("UpstreamModelManagerSheet direct add flow", () => {
 
     expect(api.gatewayModelProbe).toHaveBeenCalledTimes(1);
     expect(api.manageNativeModelCatalog).not.toHaveBeenCalledWith(expect.objectContaining({ operation: "add" }));
-    expect(await screen.findByText("已添加到 Codex")).toBeInTheDocument();
+    expect(await within(screen.getByTestId("upstream-model-vendor/model-latest")).findByText("已添加到 Codex")).toBeInTheDocument();
   });
 
   it("does not begin paid probes if local prerequisites fail", async () => {
@@ -304,7 +403,7 @@ describe("UpstreamModelManagerSheet direct add flow", () => {
     await clickProbeAndAdd(user);
 
     expect(await screen.findByText("write blocked")).toBeInTheDocument();
-    expect(screen.queryByText("已添加到 Codex")).not.toBeInTheDocument();
+    expect(within(screen.getByTestId("upstream-model-vendor/model-latest")).queryByText("已添加到 Codex")).not.toBeInTheDocument();
     expect(screen.getByTestId("upstream-model-configured-only-gpt-5")).toBeInTheDocument();
   });
 

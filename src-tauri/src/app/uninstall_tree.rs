@@ -378,8 +378,9 @@ impl Entry {
         let info = self.info()?;
         if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
             for name in self.names()? {
-                let child = self.child(&name, delete)?;
-                child.walk(delete, depth + 1)?;
+                self.child(&name, delete)
+                    .and_then(|child| child.walk(delete, depth + 1))
+                    .map_err(|error| format!("{}：{error}", name.to_string_lossy()))?;
             }
         }
         if delete {

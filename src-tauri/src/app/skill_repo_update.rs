@@ -435,9 +435,16 @@ fn io_error(context: &str, error: impl std::fmt::Display) -> HotError {
 }
 
 fn home_dir() -> Result<PathBuf, HotError> {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().to_path_buf())
-        .ok_or_else(|| io_error("无法定位用户目录", "UserDirs unavailable"))
+    static USER_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(home) = USER_HOME.get() { return Ok(home.clone()); }
+    #[cfg(windows)]
+    let desktop = super::usb_guard::elevated_usb_local_data_paths().map_err(|e| io_error("无法确定桌面用户目录", e))?
+        .map(|paths| paths.user_profile.ok_or_else(|| io_error("无法确定桌面用户目录", "USERPROFILE unavailable"))).transpose()?;
+    #[cfg(not(windows))]
+    let desktop: Option<PathBuf> = None;
+    let home = desktop.or_else(|| directories::UserDirs::new().map(|d| d.home_dir().to_owned()))
+        .ok_or_else(|| io_error("无法定位用户目录", "UserDirs unavailable"))?;
+    Ok(USER_HOME.get_or_init(|| home).clone())
 }
 
 fn state_dir() -> Result<PathBuf, HotError> {

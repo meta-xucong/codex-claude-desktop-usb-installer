@@ -139,9 +139,9 @@ fn server_loop(pipe_name: &str, session_id: u32, shell_user_sid: &str, app: taur
             continue;
         }
         let response = match validate_client_session(handle, session_id, shell_user_sid) {
-            Ok(()) => {
+            Ok(client_pid) => {
                 let mut pipe = unsafe { std::fs::File::from_raw_handle(handle as _) };
-                handle_connection(&mut pipe, app.clone(), &mut response_cache)
+                handle_connection(&mut pipe, client_pid, app.clone(), &mut response_cache)
             }
             Err(error) => {
                 let response = EntryResponse::error(error);
@@ -158,6 +158,7 @@ fn server_loop(pipe_name: &str, session_id: u32, shell_user_sid: &str, app: taur
 
 fn handle_connection(
     pipe: &mut std::fs::File,
+    client_pid: u32,
     app: tauri::AppHandle,
     response_cache: &mut EntryResponseCache,
 ) -> Result<(), String> {
@@ -165,6 +166,9 @@ fn handle_connection(
         Ok(request) if request.schema_version == 1 && valid_request_id(&request.request_id)
             && request.args.as_slice() == ["--claude-account-status"] => {
             // Return only the signed license identity. This live decision must never be cached.
+            if !crate::app::claude_session::contains(client_pid) {
+                return write_response(pipe, &EntryResponse::error("请从 U 盘管理器启动 Claude。"));
+            }
             match crate::app::usb_guard::claude_account() {
                 Ok((_, identity, _)) => EntryResponse { ok: true, message: identity },
                 Err(_) => EntryResponse::error("当前 U 盘账号不可用。"),
@@ -322,7 +326,7 @@ fn validate_client_session(
     handle: windows_sys::Win32::Foundation::HANDLE,
     expected: u32,
     expected_user_sid: &str,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -352,7 +356,7 @@ fn validate_client_session(
     if client_sid? != expected_user_sid {
         return Err("IPC 客户端不属于当前桌面用户，Codex 未启动。".to_string());
     }
-    Ok(())
+    Ok(client_pid)
 }
 
 #[cfg(windows)]

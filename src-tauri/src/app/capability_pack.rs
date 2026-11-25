@@ -117,6 +117,7 @@ pub enum FeishuConnectionAction {
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct CapabilityPackInstallOptions {
+    pub connection_edits: Option<Vec<String>>,
     pub enable_feishu: bool,
     pub feishu_action: Option<FeishuConnectionAction>,
     pub persist_connections: bool,
@@ -146,6 +147,7 @@ pub struct CapabilityPackInstallOptions {
 impl Default for CapabilityPackInstallOptions {
     fn default() -> Self {
         Self {
+            connection_edits: None,
             enable_feishu: true,
             feishu_action: None,
             persist_connections: true,
@@ -177,6 +179,10 @@ impl Default for CapabilityPackInstallOptions {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityPackReport {
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub connection_settings: Option<serde_json::Value>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub claude_sync: Option<&'static str>,
     pub available: bool,
     pub installed: bool,
     pub success: bool,
@@ -208,6 +214,8 @@ pub struct CapabilityPackReport {
 
 fn report_missing(message: impl Into<String>) -> CapabilityPackReport {
     CapabilityPackReport {
+        connection_settings: None,
+        claude_sync: None,
         available: false,
         installed: false,
         success: false,
@@ -402,6 +410,7 @@ struct ReadinessSummary {
     media_runtime_status: String,
     media_protocol_status: String,
     media_registered: bool,
+    media_registration_status: String,
     media_enabled: bool,
     media_authorization_status: String,
     media_gateway_catalog_status: String,
@@ -487,6 +496,8 @@ fn readiness_summary(codex_home: &Path) -> ReadinessSummary {
             .and_then(|v| v.as_str())
             .unwrap_or("not-checked")
             .to_string(),
+        media_registration_status: value.pointer("/connections/mediaGeneration/registrationStatus")
+            .and_then(|v| v.as_str()).unwrap_or("unknown").to_owned(),
         media_registered: value
             .pointer("/connections/mediaGeneration/registered")
             .and_then(|v| v.as_bool())
@@ -561,7 +572,8 @@ mod tests {
         let script = format!(
             "[IO.File]::WriteAllText('{quoted_path}', 'runtime.python', [Text.Encoding]::ASCII); [Console]::WriteLine('process-started'); Start-Sleep -Seconds 8"
         );
-        let mut command = Command::new("powershell.exe");
+        let mut command = Command::new(crate::app::runtime::windows_powershell().unwrap());
+        command.env("PATH", "");
         command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
         let mut stages = Vec::new();
         let error = run_capability_installer(
@@ -600,7 +612,7 @@ mod tests {
         let script = format!(
             r#"$si = [System.Diagnostics.ProcessStartInfo]::new(); $si.FileName = Join-Path $PSHOME 'powershell.exe'; $si.Arguments = '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 30"'; $si.UseShellExecute = $false; $si.CreateNoWindow = $true; $child = [System.Diagnostics.Process]::Start($si); [IO.File]::WriteAllText('{quoted_pid_path}', [string]$child.Id); [Console]::Out.WriteLine('parent-finished')"#
         );
-        let mut command = Command::new("powershell.exe");
+        let mut command = Command::new(crate::app::runtime::windows_powershell().unwrap());
         command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
         let started = Instant::now();
         let output = run_capability_installer(
@@ -690,7 +702,7 @@ mod tests {
             "runtime":{"python":{"executable":bin.join("python.exe")},"node":{"executable":bin.join("node.exe")},"hyperframes":{"status":"install-failed"}},
             "connections":{"mediaGeneration":{"runtime":"passed","protocol":"passed","gatewayCatalog":"failed"}}});
         let wrapper = bin.join("start-media-generation-mcp.ps1");
-        let config: toml::Value = format!("[mcp_servers.media_generation]\nenabled=true\ncommand='powershell.exe'\nargs=['-File', '{}']\n", wrapper.display()).parse().unwrap();
+        let config: toml::Value = format!("[mcp_servers.media_generation]\nenabled=true\ncommand='{}'\nargs=['-File', '{}']\n", bin.join("python.exe").display(), wrapper.display()).parse().unwrap();
         assert!(super::host_core_files_ready(&home, &config, &readiness, "fixture"));
         assert!(!super::host_core_files_ready(&home, &config, &readiness, "new-version"));
         fs::remove_file(&wrapper).unwrap();
@@ -698,6 +710,67 @@ mod tests {
         let disabled: toml::Value = "[mcp_servers.media_generation]\nenabled=false".parse().unwrap();
         assert!(super::host_core_files_ready(&home, &disabled, &readiness, "fixture"));
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_shell_migration_updates_only_enabled_pack_wrappers() {
+        let home = std::env::temp_dir().join(format!("usb-shell-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&home).unwrap();
+        let root = home.as_path();
+        let path = root.join("config.toml");
+        let bin = root.join("codex-agent-kit/bin");
+        let old = format!(r#"model_provider = "keep"
+[mcp_servers.media_generation]
+command = 'powershell.exe' # keep this comment
+args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '{}']
+[mcp_servers.feishu]
+command = 'powershell.exe'
+args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '{}']
+[mcp_servers.personal]
+command = 'powershell.exe'
+args = ['-File', 'personal.ps1']
+"#, bin.join("start-media-generation-mcp.ps1").display(), bin.join("start-feishu-mcp.ps1").display());
+        fs::write(&path, &old).unwrap();
+        let config = super::migrate_pack_shells(root, old.parse().unwrap()).unwrap();
+        let shell = super::super::runtime::windows_powershell().unwrap();
+        for server in ["media_generation", "feishu"] {
+            assert_eq!(config["mcp_servers"][server]["command"].as_str(), shell.to_str());
+        }
+        assert_eq!(config["model_provider"].as_str(), Some("keep"));
+        assert_eq!(config["mcp_servers"]["personal"]["command"].as_str(), Some("powershell.exe"));
+        let once = fs::read_to_string(&path).unwrap();
+        assert!(once.contains("# keep this comment"));
+        super::migrate_pack_shells(root, config).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), once);
+        let custom = old.replace("start-media-generation-mcp.ps1", "personal.ps1")
+                        .replace("[mcp_servers.feishu]", "[mcp_servers.feishu]\nenabled=false");
+        fs::write(&path, &custom).unwrap();
+        super::migrate_pack_shells(root, custom.parse().unwrap()).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), custom);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn connection_delta_adds_figma_and_keeps_existing_credentials_media_and_other_mcps() {
+        let saved = super::CapabilityPackInstallOptions {
+            enabled_remote_mcps: vec!["linear".into()], enabled_api_services: vec!["dashscope-web-search".into()],
+            dashscope_api_key: "fixture".into(), dashscope_model: "retained".into(),
+            media_generation_agent_id: "fixture-route".into(), seedance_model:"video".into(),
+            feishu_app_id:"cli_existing".into(), ..Default::default()
+        };
+        let input = super::CapabilityPackInstallOptions {
+            connection_edits:Some(vec!["figma".into()]), enabled_remote_mcps:vec!["figma".into()],
+            ..Default::default()
+        };
+        let merged = super::merge_connection_edits(saved, input).unwrap();
+        assert_eq!(merged.enabled_remote_mcps, ["linear","figma"]);
+        assert_eq!(merged.enabled_api_services, ["dashscope-web-search"]);
+        assert_eq!(merged.dashscope_api_key, "fixture");
+        assert_eq!(merged.dashscope_model, "retained");
+        assert_eq!(merged.seedance_model, "video");
+        assert_eq!(merged.media_generation_agent_id, "fixture-route");
+        assert_eq!(merged.feishu_app_id, "cli_existing");
     }
 
     #[test]
@@ -741,7 +814,8 @@ url = "https://example.invalid/mcp"
         submitted.feishu_app_secret = " fixture-secret ".into();
         assert!(validate_feishu_options(&submitted).is_ok());
         let home = std::path::Path::new(r"C:\Users\Fixture\.codex");
-        let planned = plan_feishu_config(current, home, &submitted).unwrap();
+        let system_shell = std::path::Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let planned = plan_feishu_config(current, system_shell, home, &submitted).unwrap();
         assert!(planned.contains("# BEGIN CODEX-STARTER-KIT MANAGED CONFIG v1"));
         assert!(planned.contains("# END CODEX-STARTER-KIT MANAGED CONFIG v1"));
         let before: toml::Value = current.parse().unwrap();
@@ -752,6 +826,7 @@ url = "https://example.invalid/mcp"
             parsed["mcp_servers"]["feishu"]["enabled"].as_bool(),
             Some(true)
         );
+        assert_eq!(parsed["mcp_servers"]["feishu"]["command"].as_str(), system_shell.to_str());
         assert_eq!(parsed["model"], before["model"]);
         for server in ["media_generation", "cloudflare"] {
             assert_eq!(parsed["mcp_servers"][server], before["mcp_servers"][server]);
@@ -774,7 +849,7 @@ url = "https://example.invalid/mcp"
         assert_eq!(preserved.feishu_app_id, "cli_fixture");
 
         submitted.enable_feishu = false;
-        let disabled: toml::Value = plan_feishu_config(&planned, home, &submitted)
+        let disabled: toml::Value = plan_feishu_config(&planned, system_shell, home, &submitted)
             .unwrap()
             .parse()
             .unwrap();
@@ -823,7 +898,13 @@ url = "https://example.invalid/mcp"
             toml::Value::String(home.join("codex-agent-kit/bin/start-feishu-mcp.ps1").to_string_lossy().into_owned());
         config["mcp_servers"]["feishu"]["args"].as_array_mut().unwrap()[3] =
             toml::Value::String(home.join("codex-agent-kit/runtime/feishu").to_string_lossy().into_owned());
-        assert!(feishu_can_save_live(&config, &home, &options));
+        assert!(!feishu_can_save_live(&config, &home, &options));
+        #[cfg(windows)]
+        {
+            config["mcp_servers"]["feishu"]["command"] =
+                toml::Value::String(super::super::runtime::windows_powershell().unwrap().to_string_lossy().into_owned());
+            assert!(feishu_can_save_live(&config, &home, &options));
+        }
         options.feishu_domain = "https://open.larksuite.com".into();
         assert!(!feishu_can_save_live(&config, &home, &options));
 
@@ -959,6 +1040,8 @@ url = "https://example.invalid/mcp"
         let mut unregistered = readiness.clone();
         unregistered.media_registered = false;
         assert!(!media_install_ready(&unregistered, &codex_home));
+        unregistered.media_registration_status = "config-unmerged".into();
+        assert_eq!(super::media_install_issue(&unregistered, &codex_home), Some("媒体 MCP 配置未合并，请查看 config-merge.log"));
         let mut unhealthy = readiness.clone();
         unhealthy.media_protocol_status = "failed".to_string();
         assert!(!media_install_ready(&unhealthy, &codex_home));
@@ -1076,23 +1159,35 @@ fn overall_status(core_ready: bool, runtime_status: &str, config_status: &str) -
     }
 }
 
+fn media_install_issue(readiness: &ReadinessSummary, codex_home: &Path) -> Option<&'static str> {
+    if !readiness.media_registered || !readiness.media_enabled {
+        return Some(match readiness.media_registration_status.as_str() {
+            "not-rendered" => "配置未生成媒体 MCP 条目，请查看 config-merge.log",
+            "config-unmerged" => "媒体 MCP 配置未合并，请查看 config-merge.log",
+            "entry-missing" => "本机配置缺少媒体 MCP 条目",
+            "entry-disabled" | "not-requested" => "本机媒体 MCP 未启用",
+            "wrapper-mismatch" => "本机媒体 MCP 的启动配置与能力包不匹配",
+            "config-unreadable" => "本机媒体 MCP 配置无法读取或解析",
+            "check-unavailable" => "本机媒体 MCP 注册检查未能运行",
+            _ => "未确认媒体 MCP 注册，请查看 config-merge.log",
+        });
+    }
+    if readiness.media_authorization_status != "verified" { return Some("本机媒体授权尚未确认"); }
+    if readiness.media_runtime_status != "passed" { return Some("本机媒体运行时自检未通过"); }
+    if readiness.media_protocol_status != "passed" { return Some("本机媒体 MCP 协议自检未通过"); }
+    let kit = codex_home.join(KIT_HOME_RELATIVE);
+    if !kit.join("bin/start-media-generation-mcp.ps1").is_file() || !kit.join("bin/media-generation-mcp.py").is_file() {
+        return Some("本机缺少媒体 MCP 程序文件");
+    }
+    if !kit.join("connections/media-generation.connection.json").is_file() || !kit.join("connections/media-generation.credential.dpapi").is_file() {
+        return Some("本机缺少媒体 MCP 授权文件");
+    }
+    None
+}
+
+#[cfg(test)]
 fn media_install_ready(readiness: &ReadinessSummary, codex_home: &Path) -> bool {
-    let kit_home = codex_home.join(KIT_HOME_RELATIVE);
-    readiness.media_registered
-        && readiness.media_enabled
-        && readiness.media_authorization_status == "verified"
-        && readiness.media_runtime_status == "passed"
-        && readiness.media_protocol_status == "passed"
-        && kit_home
-            .join("bin/start-media-generation-mcp.ps1")
-            .is_file()
-        && kit_home.join("bin/media-generation-mcp.py").is_file()
-        && kit_home
-            .join("connections/media-generation.connection.json")
-            .is_file()
-        && kit_home
-            .join("connections/media-generation.credential.dpapi")
-            .is_file()
+    media_install_issue(readiness, codex_home).is_none()
 }
 
 fn write_media_authorization_status(profile: &Path, status: &str) -> Result<(), AppError> {
@@ -1521,7 +1616,7 @@ pub fn install_product_design_plugin(app: &AppHandle) -> Result<u32, AppError> {
             "U 盘安装包缺少离线 Product Design 安装脚本".to_string(),
         ));
     }
-    let mut command = Command::new("powershell.exe");
+    let mut command = Command::new(super::runtime::windows_powershell()?);
     command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
     command
         .arg(&installer)
@@ -1574,6 +1669,59 @@ pub(crate) fn host_core_ready(home: &Path, config: &toml::Value) -> Result<bool,
     Ok(host_core_files_ready(home, config, &readiness, &version))
 }
 
+const PACK_SHELL_WRAPPERS: [(&str, &str); 2] = [
+    ("media_generation", "start-media-generation-mcp.ps1"),
+    ("feishu", "start-feishu-mcp.ps1"),
+];
+
+fn has_legacy_pack_shell(config: &toml::Value, home: &Path, name: &str, wrapper: &str) -> bool {
+    let Some(server) = config.get("mcp_servers").and_then(|all| all.get(name)) else { return false };
+    if server.get("enabled").and_then(|v| v.as_bool()) == Some(false)
+        || !server.get("command").and_then(|v| v.as_str()).is_some_and(|s| s.eq_ignore_ascii_case("powershell.exe")) {
+        return false;
+    }
+    let wrapper = home.join("codex-agent-kit/bin").join(wrapper);
+    let Some(args) = server.get("args").and_then(|v| v.as_array()) else { return false };
+    let flags = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"];
+    args.len() >= 5 && args[..4].iter().filter_map(|v| v.as_str()).eq(flags)
+        && args[4].as_str().is_some_and(|p| codex_win_engine::same_windows_path(Path::new(p), &wrapper))
+}
+
+fn replace_pack_shell(doc: &mut toml_edit::Document, name: &str, shell: &str) {
+    let value = doc["mcp_servers"][name]["command"].as_value_mut().expect("matched TOML string");
+    let mut command = toml_edit::Value::from(shell);
+    *command.decor_mut() = value.decor().clone();
+    *value = command;
+}
+
+// Called by host initialization only. Preserve every setting except the old command.
+pub(crate) fn migrate_pack_shells(home: &Path, config: toml::Value) -> Result<toml::Value, AppError> {
+    if !PACK_SHELL_WRAPPERS.iter().any(|(n, w)| has_legacy_pack_shell(&config, home, n, w)) {
+        return Ok(config);
+    }
+    let _lock = super::model_selection_client::lock_configuration()
+        .map_err(|_| AppError::Busy("另一个 Codex 配置操作正在进行，请稍后重试".into()))?;
+    let path = home.join("config.toml");
+    let bytes = fs::read(&path).map_err(|e| AppError::Engine(e.to_string()))?;
+    let raw = std::str::from_utf8(strip_utf8_bom(&bytes)).map_err(|e| AppError::Engine(e.to_string()))?;
+    let mut current = raw.parse::<toml::Value>().map_err(|e| AppError::Engine(e.message().into()))?;
+    let mut doc = raw.parse::<toml_edit::Document>().map_err(|_| AppError::Engine("无法解析本机 Codex 配置".into()))?;
+    let shell = super::runtime::windows_powershell()?.to_string_lossy().into_owned();
+    let mut changed = false;
+    for (name, wrapper) in PACK_SHELL_WRAPPERS {
+        if has_legacy_pack_shell(&current, home, name, wrapper) {
+            replace_pack_shell(&mut doc, name, &shell);
+            current["mcp_servers"][name]["command"] = toml::Value::String(shell.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        super::atomic_file::write_atomic_preserving_backup(&path, doc.to_string().as_bytes())
+            .map_err(|e| AppError::Engine(e.to_string()))?;
+    }
+    Ok(current)
+}
+
 fn host_core_files_ready(home: &Path, config: &toml::Value, readiness: &serde_json::Value, version: &str) -> bool {
     if readiness.pointer("/pack/id").and_then(|v| v.as_str()) != Some(PACK_ID)
         || readiness.pointer("/pack/version").and_then(|v| v.as_str()) != Some(version)
@@ -1588,6 +1736,7 @@ fn host_core_files_ready(home: &Path, config: &toml::Value, readiness: &serde_js
             .and_then(|v| v.as_str()).is_some_and(|p| Path::new(p).is_file()) { return false; }
     }
     let Some(media) = config.get("mcp_servers").and_then(|v| v.get("media_generation")) else { return false };
+    if PACK_SHELL_WRAPPERS.iter().any(|(n, w)| has_legacy_pack_shell(config, home, n, w)) { return false; }
     // A deliberate disable is a user setting, not an installation failure.
     if media.get("enabled").and_then(|v| v.as_bool()) == Some(false) { return true; }
     let wrapper = home.join("codex-agent-kit/bin/start-media-generation-mcp.ps1");
@@ -1643,12 +1792,46 @@ fn host_install_options_with_settings(home: &Path, saved: std::collections::Hash
     }
     if let Some(bytes) = crate::app::usb_host::read_optional(&readiness_path(home))? {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(strip_utf8_bom(&bytes)) {
+            if let Some(media) = value.pointer("/connections/mediaGeneration") {
+                if let Some(status) = media["gatewayCatalog"].as_str() { options.media_gateway_catalog_status = status.to_owned(); }
+                options.media_gateway_model_count = media["gatewayModelCount"].as_u64().unwrap_or(0) as usize;
+                options.media_gateway_catalog_verified_at = media["gatewayCatalogVerifiedAt"].as_str().map(str::to_owned);
+            }
             if value.pointer("/connections/apiServices/enabled/dashscope-web-search").and_then(|v| v.as_bool()) == Some(true) {
                 options.enabled_api_services.push("dashscope-web-search".into());
             }
         }
     }
     Ok(options)
+}
+
+fn merge_connection_edits(mut saved: CapabilityPackInstallOptions, input: CapabilityPackInstallOptions) -> Result<CapabilityPackInstallOptions, AppError> {
+    let changes = input.connection_edits.as_deref().unwrap_or(&[]);
+    for field in changes {
+        match field.as_str() {
+            "cloudflare" | "figma" | "linear" | "notion" => {
+                saved.enabled_remote_mcps.retain(|s| s != field);
+                if input.enabled_remote_mcps.contains(field) { saved.enabled_remote_mcps.push(field.clone()); }
+            }
+            "dashscope-web-search" => saved.enabled_api_services = input.enabled_api_services.clone(),
+            "media-generation" => saved.enable_media_generation = input.enable_media_generation,
+            "dashscopeApiKey" if !input.dashscope_api_key.trim().is_empty() => saved.dashscope_api_key.clone_from(&input.dashscope_api_key),
+            "dashscopeApiKey" => {},
+            "dashscopeBaseUrl" => saved.dashscope_base_url.clone_from(&input.dashscope_base_url),
+            "dashscopeModel" => saved.dashscope_model.clone_from(&input.dashscope_model),
+            "mediaGenerationAgentId" => saved.media_generation_agent_id.clone_from(&input.media_generation_agent_id),
+            "image2Model" => saved.image2_model.clone_from(&input.image2_model),
+            "grokImageModel" => saved.grok_image_model.clone_from(&input.grok_image_model),
+            "grokVideoModel" => saved.grok_video_model.clone_from(&input.grok_video_model),
+            "seedanceModel" => saved.seedance_model.clone_from(&input.seedance_model),
+            "minimaxVideoModel" => saved.minimax_video_model.clone_from(&input.minimax_video_model),
+            _ => return Err(AppError::Engine("未知的连接设置字段".into())),
+        }
+    }
+    saved.persist_connections = input.persist_connections;
+    saved.feishu_action = Some(FeishuConnectionAction::Preserve);
+    saved.connection_edits = input.connection_edits;
+    Ok(saved)
 }
 
 fn preserve_feishu_selection(
@@ -1714,7 +1897,10 @@ fn feishu_can_save_live(
         })
     };
     server.get("enabled").and_then(toml::Value::as_bool) == Some(true)
-        && server.get("command").and_then(toml::Value::as_str) == Some("powershell.exe")
+        && server.get("command").and_then(toml::Value::as_str).is_some_and(|cmd| {
+            super::runtime::windows_powershell().is_ok_and(|system|
+                codex_win_engine::same_windows_path(Path::new(cmd), &system))
+        })
         && server
             .get("env_vars")
             .and_then(toml::Value::as_array)
@@ -1732,7 +1918,7 @@ fn feishu_can_save_live(
         })
 }
 
-pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
+pub fn status(app: &AppHandle, include_connections: bool) -> Result<CapabilityPackReport, AppError> {
     if !cfg!(target_os = "windows") {
         return Ok(report_missing("当前平台不支持 Windows 能力包安装"));
     }
@@ -1752,7 +1938,16 @@ pub fn status(app: &AppHandle) -> Result<CapabilityPackReport, AppError> {
         None
     };
     let codex_home = usb_codex_home.unwrap_or_else(|| profile.join(".codex"));
-    Ok(pack_status_at(&source, &version, &codex_home, true))
+    let mut report = pack_status_at(&source, &version, &codex_home, true);
+    if include_connections {
+        let saved = host_install_options(&codex_home)?;
+        report.connection_settings = Some(serde_json::json!({
+            "remote":saved.enabled_remote_mcps, "api":saved.enabled_api_services, "media":saved.enable_media_generation,
+            "dashscopeConfigured":!saved.dashscope_api_key.is_empty(), "dashscopeBaseUrl":saved.dashscope_base_url,
+            "dashscopeModel":saved.dashscope_model
+        }));
+    }
+    Ok(report)
 }
 
 fn pack_status_at(
@@ -1783,6 +1978,8 @@ fn pack_status_at(
         effective_config_status,
     );
     CapabilityPackReport {
+        connection_settings: None,
+        claude_sync: None,
         available: true,
         installed,
         success: status == "ready",
@@ -2242,7 +2439,9 @@ fn persist_configured_environment(
     if options.enable_feishu && options.feishu_action != Some(FeishuConnectionAction::Preserve) {
         values.extend(feishu_environment_values(options));
     }
-    if selected_service(options, "dashscope-web-search") {
+    let touched = |names: &[&str]| options.connection_edits.as_ref()
+        .is_none_or(|fields| fields.iter().any(|f| names.contains(&f.as_str())));
+    if selected_service(options, "dashscope-web-search") && touched(&["dashscope-web-search","dashscopeApiKey","dashscopeBaseUrl","dashscopeModel"]) {
         values.extend([
             ("DASHSCOPE_API_KEY", options.dashscope_api_key.as_str()),
             ("DASHSCOPE_BASE_URL", options.dashscope_base_url.as_str()),
@@ -2252,6 +2451,9 @@ fn persist_configured_environment(
     // The manager owns these model slots. Persist empty values too so a model
     // that disappeared from the live upstream catalog cannot survive from an
     // earlier install as a stale fallback.
+    if !touched(&["media-generation","mediaGenerationAgentId","image2Model","grokImageModel","grokVideoModel","seedanceModel","minimaxVideoModel"]) {
+        return persist_connection_values(profile, values);
+    }
     let media_values = if options.enable_media_generation {
         [
             options.media_generation_agent_id.as_str(),
@@ -2304,6 +2506,7 @@ fn persist_connection_values(profile: &Path, values: Vec<(&str, &str)>) -> Resul
 
 fn plan_feishu_config(
     current: &str,
+    system_shell: &Path,
     home: &Path,
     options: &CapabilityPackInstallOptions,
 ) -> Result<String, AppError> {
@@ -2342,6 +2545,7 @@ fn plan_feishu_config(
     )
     .to_owned();
     for (placeholder, replacement) in [
+        ("__WINDOWS_POWERSHELL__", quote(&system_shell.to_string_lossy())),
         ("__FEISHU_ENABLED__", "true".to_owned()),
         (
             "__FEISHU_WRAPPER__",
@@ -2423,7 +2627,7 @@ fn prepare_feishu_runtime(
         }
     }
     let progress = CapabilityProgressFile::create()?;
-    let mut command = Command::new("powershell.exe");
+    let mut command = Command::new(super::runtime::windows_powershell()?);
     command
         .current_dir(source)
         .args([
@@ -2501,12 +2705,24 @@ fn save_feishu_connection(
     let current_bytes = crate::app::usb_host::read_optional(&config_path)?.unwrap_or_default();
     let current = std::str::from_utf8(strip_utf8_bom(&current_bytes))
         .map_err(|_| AppError::Engine("无法读取本机 Codex 配置，原设置未更改".into()))?;
-    let config = current
+    let mut config = current
         .parse::<toml::Value>()
         .map_err(|_| AppError::Engine("无法解析本机 Codex 配置，原设置未更改".into()))?;
     let same_registration = feishu_can_save_live(&config, home, options);
     if !same_registration {
-        let planned = plan_feishu_config(current, home, options)?;
+        let shell = super::runtime::windows_powershell()?;
+        let old_shell = has_legacy_pack_shell(&config, home, "feishu", "start-feishu-mcp.ps1");
+        if old_shell {
+            config["mcp_servers"]["feishu"]["command"] = toml::Value::String(shell.to_string_lossy().into_owned());
+        }
+        let planned = if old_shell && feishu_can_save_live(&config, home, options) {
+            let mut doc = current.parse::<toml_edit::Document>()
+                .map_err(|_| AppError::Engine("无法解析本机飞书 MCP 配置".into()))?;
+            replace_pack_shell(&mut doc, "feishu", &shell.to_string_lossy());
+            doc.to_string()
+        } else {
+            plan_feishu_config(current, &shell, home, options)?
+        };
         if planned != current {
             crate::app::atomic_file::write_atomic_preserving_backup(
                 &config_path,
@@ -2569,7 +2785,9 @@ pub fn install(
             return save_feishu_connection(&source, &pack_version, &profile, &codex_home, &options);
         }
         Some(FeishuConnectionAction::Preserve) => {
-            options = preserve_feishu_selection(options, host_install_options(&codex_home)?);
+            let saved = host_install_options(&codex_home)?;
+            options = if options.connection_edits.is_some() { merge_connection_edits(saved, options)? }
+                else { preserve_feishu_selection(options, saved) };
         }
         None => {}
     }
@@ -2577,7 +2795,7 @@ pub fn install(
     if options.enable_media_generation {
         migrate_legacy_media_environment(&codex_home)?;
     }
-    let mut command = Command::new("powershell.exe");
+    let mut command = Command::new(super::runtime::windows_powershell()?);
     command
         .current_dir(&source)
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
@@ -2607,16 +2825,10 @@ pub fn install(
         command.arg("-DisableFeishu");
     }
     if !options.enabled_api_services.is_empty() {
-        command.arg("-EnabledApiServices");
-        for service in &options.enabled_api_services {
-            command.arg(service);
-        }
+        command.arg("-EnabledApiServices").arg(options.enabled_api_services.join(","));
     }
     if !options.enabled_remote_mcps.is_empty() {
-        command.arg("-EnabledRemoteMcps");
-        for server in &options.enabled_remote_mcps {
-            command.arg(server);
-        }
+        command.arg("-EnabledRemoteMcps").arg(options.enabled_remote_mcps.join(","));
     }
     command.arg(media_install_switch(options.enable_media_generation));
     if options.enable_media_generation {
@@ -2802,18 +3014,21 @@ pub fn install(
             ),
         ));
     }
-    if options.enable_media_generation && !media_install_ready(&readiness, &codex_home) {
+    if let Some(reason) = options.enable_media_generation.then(|| media_install_issue(&readiness, &codex_home)).flatten() {
         log::error!(
-            "media MCP readiness failed source={} version={} runtime={} protocol={} registered={} kit_home={}",
+            "media MCP readiness failed source={} version={} runtime={} protocol={} registered={} config_status={} reason={reason} kit_home={}",
             source.display(),
             pack_version,
             readiness.media_runtime_status,
             readiness.media_protocol_status,
             readiness.media_registered,
+            match readiness.config_status.as_str() {
+                "merged" => "merged", "partial" => "partial", "conflict" => "conflict", _ => "unknown",
+            },
             codex_home.join(KIT_HOME_RELATIVE).display()
         );
         return Err(AppError::Engine(format!(
-            "核心能力包已安装，但统一媒体 MCP 未就绪：部署文件、Codex 注册或协议自检未通过；请查看 {} 并从组件修复入口重试",
+            "核心能力包已安装，媒体 MCP 未就绪：{reason}。安装详情见 {}",
             readiness
                 .diagnostics_path
                 .as_deref()
@@ -2834,6 +3049,8 @@ pub fn install(
     );
     let enabled_api_services = options.enabled_api_services.clone();
     Ok(CapabilityPackReport {
+        connection_settings: None,
+        claude_sync: None,
         available: true,
         installed: true,
         success: status == "ready",

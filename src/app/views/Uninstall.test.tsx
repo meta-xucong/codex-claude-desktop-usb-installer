@@ -17,6 +17,8 @@ vi.mock("../../services/managerApi", async (importOriginal) => ({
     winUninstallBundle: vi.fn(),
     getUninstallHandoff: vi.fn(),
     completeUninstallHandoff: vi.fn(),
+    retryUninstallProfile: vi.fn(),
+    dismissUninstallProfileRetry: vi.fn(),
     retryAncillary: vi.fn(),
     armDestructive: vi.fn(() => Promise.resolve("token")),
     openCodexHome: vi.fn(() => Promise.resolve()),
@@ -555,15 +557,19 @@ describe("Uninstall", () => {
   it("requires confirmation before retrying a failed Windows user-data purge", async () => {
     const user = userEvent.setup();
     const original = await winUninstallBundle.getMockImplementation()!(true, false, false);
-    winUninstallBundle.mockResolvedValue({ ...original, message: "Codex removed but selected data purge failed",
+    winUninstallBundle.mockResolvedValue({ ...original, success: false, profileRetryId: "profile-retry", message: "Codex removed but selected data purge failed",
       outcome: emptyOperationOutcome({ primaryOk: true, appState: "absent", path: "D:\\WindowsApps\\OpenAI.Codex",
         cleanup: { state: "failed", detail: "purge failed: file locked" }, recoveryActions: ["purge_user_data"] }),
     });
+    const retryProfile = vi.mocked(managerApi.retryUninstallProfile);
+    retryProfile.mockRejectedValueOnce({ code: "busy", message: "fixture.bin is still open" })
+      .mockResolvedValueOnce({ id: "final-helper", message: "Ready", reportPath: "cleanup.json" });
     await openBundle(user);
     await user.click(screen.getByRole("button", { name: "Uninstall Codex + CCSwitch" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: "Erase data & uninstall" }));
     await user.click(await screen.findByRole("button", { name: /Retry purging user data only/i }));
+    expect(screen.queryByRole("button", { name: CATALOG.en["uninstall.bundle.continueFinalCleanup"] })).not.toBeInTheDocument();
     const dialog = screen.getByRole("dialog", { name: CATALOG.en["uninstall.bundle.retryPurgeTitle"] });
     for (const path of CODEX_PURGE_PATHS) expect(dialog).toHaveTextContent(path);
     for (const path of CCSWITCH_PURGE_PATHS) expect(dialog).not.toHaveTextContent(path);
@@ -574,9 +580,35 @@ describe("Uninstall", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: CATALOG.en["uninstall.bundle.retryPurgeTitle"] })).not.toBeInTheDocument());
     await user.click(screen.getByRole("button", { name: /Retry purging user data only/i }));
     await user.click(within(screen.getByRole("dialog", { name: CATALOG.en["uninstall.bundle.retryPurgeTitle"] })).getByRole("button", { name: /Retry purging user data only/i }));
-    await waitFor(() => expect(retryAncillary).toHaveBeenCalledWith({ actions: ["purge_user_data"], purgeUserData: true, path: "D:\\WindowsApps\\OpenAI.Codex" }));
+    await waitFor(() => expect(retryProfile).toHaveBeenCalledWith("profile-retry"));
+    expect(await screen.findByText("fixture.bin is still open", { selector: "pre.errdetails" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: CATALOG.en["uninstall.bundle.continueFinalCleanup"] })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: CATALOG.en["uninstall.bundle.retryPurgeTitle"] })).not.toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: /Retry purging user data only/i }));
+    await user.click(within(screen.getByRole("dialog", { name: CATALOG.en["uninstall.bundle.retryPurgeTitle"] })).getByRole("button", { name: /Retry purging user data only/i }));
     expect(winUninstallBundle).toHaveBeenCalledTimes(1);
     expect(winUninstallBundle).toHaveBeenCalledWith(true, true, true, true);
+    await user.click(await screen.findByRole("button", { name: "Finish and exit" }));
+    expect(completeUninstallHandoff).toHaveBeenCalledWith("final-helper");
+    expect(retryAncillary).not.toHaveBeenCalled();
+    expect(retryProfile).toHaveBeenCalledTimes(2);
+    expect(winUninstallBundle).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores the data-only retry on remount without uninstalling either app", async () => {
+    setPlatform("Win32");
+    vi.mocked(managerApi.getUninstallHandoff).mockResolvedValueOnce({
+      id: "profile-retry", profileRetry: true, reportPath: "", message: "fixture.bin is still open",
+    });
+    const onBack = vi.fn();
+    render(<I18nProvider><Uninstall onBack={onBack} bundleMode /></I18nProvider>);
+    expect(await screen.findByRole("button", { name: /Retry purging user data only/i })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Finish and exit" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getAllByRole("button", { name: "Back" }).at(-1)!);
+    expect(managerApi.dismissUninstallProfileRetry).toHaveBeenCalledWith("profile-retry");
+    expect(onBack).toHaveBeenCalledOnce();
+    expect(winUninstallBundle).not.toHaveBeenCalled();
+    expect(managerApi.retryUninstallProfile).not.toHaveBeenCalled();
   });
 
   it("preserves raw retry failure without claiming ancillary completion", async () => {

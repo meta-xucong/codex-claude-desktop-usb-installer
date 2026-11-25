@@ -256,7 +256,7 @@ pub fn verify_authorized_local_connection() -> Result<(), AppError> {
             "媒体 MCP 本机启动脚本不存在，无法验证授权".into(),
         ));
     }
-    let mut command = std::process::Command::new("powershell.exe");
+    let mut command = std::process::Command::new(super::runtime::windows_powershell()?);
     command
         .args([
             "-NoProfile",
@@ -315,13 +315,16 @@ fn validate_credential_check_output(output: &std::process::Output) -> Result<(),
     Ok(())
 }
 
-fn local_connection_paths() -> Result<(PathBuf, PathBuf), AppError> {
-    let codex_home = usb_guard::local_data_paths()?.codex_home;
+pub(crate) fn connection_paths_in(codex_home: &Path) -> (PathBuf, PathBuf) {
     let connections = codex_home.join("codex-agent-kit").join("connections");
-    Ok((
+    (
         connections.join(CREDENTIAL_FILE),
         connections.join(CONNECTION_FILE),
-    ))
+    )
+}
+
+fn local_connection_paths() -> Result<(PathBuf, PathBuf), AppError> {
+    Ok(connection_paths_in(&usb_guard::local_data_paths()?.codex_home))
 }
 
 fn sync_local_connection(binding: Option<&UsbAccountBinding>) -> Result<(), AppError> {

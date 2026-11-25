@@ -18,7 +18,7 @@ TARGETS = {
 BATCH_LAUNCHER = ROOT / "installer-pack" / "Install-Codex-Starter.cmd"
 
 POWERSHELL_CALL = re.compile(
-    r"(?i)&\s*(?P<executable>powershell\.exe|\$powershell(?:Command\.Source)?)\s+@(?P<arguments>[A-Za-z_]\w*)\b"
+    r"(?i)&\s*(?P<executable>powershell\.exe|\$powershell(?:Command\.Source)?|\(Join-Path \(\[Environment\]::SystemDirectory\) 'WindowsPowerShell\\v1\.0\\powershell\.exe'\))\s+@(?P<arguments>[A-Za-z_]\w*)\b"
 )
 WINDOW_STYLE = re.compile(
     r"(?i)(?:['\"]-WindowStyle['\"]\s*,\s*['\"]Hidden['\"]|-WindowStyle\s+Hidden)"
@@ -96,19 +96,13 @@ class InstallerChainWindowStaticTests(unittest.TestCase):
 
     def test_python_installer_start_process_is_hidden(self):
         source = self.read_target("provision-runtime.ps1")
-        start_process_lines = [
-            line
-            for line in source.splitlines()
-            if re.search(r"(?i)\bStart-Process\b", line)
-        ]
-        self.assertEqual(len(start_process_lines), 1, "expected one Python installer Start-Process call")
-        statement = start_process_lines[0]
-        self.assertIn("$pythonInstaller", statement)
-        self.assertRegex(statement, WINDOW_STYLE)
+        self.assertIn("Invoke-NativeCapture -Executable $pythonInstaller", source)
+        capture = source.split("function Invoke-NativeCapture(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("$startInfo.UseShellExecute = $false", capture)
+        self.assertIn("$startInfo.CreateNoWindow = $true", capture)
+        self.assertIn("$process.StartInfo = $startInfo", capture)
 
         for name in TARGETS:
-            if name == "provision-runtime.ps1":
-                continue
             source = self.read_target(name)
             self.assertNotRegex(
                 source,
@@ -184,7 +178,7 @@ class InstallerChainWindowStaticTests(unittest.TestCase):
     def test_batch_entrypoint_hides_both_powershell_children(self):
         self.assertTrue(BATCH_LAUNCHER.is_file(), f"missing batch entrypoint: {BATCH_LAUNCHER}")
         source = BATCH_LAUNCHER.read_text(encoding="utf-8")
-        calls = [line for line in source.splitlines() if re.search(r"(?i)^powershell\.exe\s", line.strip())]
+        calls = [line for line in source.splitlines() if re.search(r'(?i)^(?:powershell\.exe|"%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe")\s', line.strip())]
         self.assertEqual(len(calls), 2, "expected wizard and noninteractive PowerShell entrypoints")
         for line in calls:
             self.assertRegex(line, r"(?i)-WindowStyle\s+Hidden", "batch PowerShell child must be hidden")

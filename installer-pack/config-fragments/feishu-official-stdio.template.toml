@@ -1,7 +1,7 @@
 # Render with scripts/render-codex-config.ps1. Do not enable this template directly.
 [mcp_servers.feishu]
 enabled = __FEISHU_ENABLED__
-command = "powershell.exe"
+command = __WINDOWS_POWERSHELL__
 args = [
   "-NoProfile",
   "-ExecutionPolicy",

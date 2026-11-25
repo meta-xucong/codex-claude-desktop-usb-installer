@@ -75,6 +75,13 @@ function Test-BasePython([string]$Executable) {
     return $result.ExitCode -eq 0
 }
 
+function Expand-BundledZip([string]$Zip, [string]$Destination) {
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $tar = Join-Path ([Environment]::SystemDirectory) 'tar.exe'
+    & $tar -xf $Zip -C $Destination
+    if ($LASTEXITCODE -ne 0) { throw "Bundled ZIP extraction failed for $([IO.Path]::GetFileName($Zip)) (tar exit $LASTEXITCODE)." }
+}
+
 function Get-NodeVersion([string]$Executable) {
     if ([string]::IsNullOrWhiteSpace($Executable) -or -not (Test-Path -LiteralPath $Executable -PathType Leaf)) { return $null }
     $result = Invoke-NativeCapture -Executable $Executable -Arguments @('--version')
@@ -215,7 +222,7 @@ function Test-FeishuRuntime([string]$NodeExe, [string]$FeishuRoot) {
 
 function Restore-FeishuRuntime([string]$Zip, [string]$NodeExe, [string]$FeishuRoot) {
     # A prior extraction can leave the CLI behind without its dependencies.
-    Expand-Archive -LiteralPath $Zip -DestinationPath $FeishuRoot -Force
+    Expand-BundledZip $Zip $FeishuRoot
     if (-not (Test-FeishuRuntime $NodeExe $FeishuRoot)) {
         throw 'Offline Feishu MCP CLI health check failed after extraction.'
     }
@@ -236,7 +243,7 @@ if ($FeishuOnly) {
         $mediaManifest = Read-Json $mediaManifestPath
         if ($nodeNeedsRepair) {
             $nodeZip = Assert-Media $mediaManifest 'runtime.node22-common' $packRootFull
-            Expand-Archive -LiteralPath $nodeZip -DestinationPath $runtimeRoot -Force
+            Expand-BundledZip $nodeZip $runtimeRoot
             $nodeVersion = Get-NodeVersion $nodeExe
             if ($null -eq $nodeVersion -or $nodeVersion.Major -lt 22) {
                 throw 'Bundled Node.js 22 runtime is not healthy after extraction.'
@@ -387,7 +394,7 @@ $feishuHealth = 'disabled'
 $feishuError = ''
 # node.exe can run before npm/npx have been extracted. Explicit capability
 # setup restores the complete bundled Node distribution.
-Expand-Archive -LiteralPath $nodeZip -DestinationPath $runtimeRoot -Force
+Expand-BundledZip $nodeZip $runtimeRoot
 $nodeVersionObject = Get-NodeVersion $nodeExe
 if ($nodeVersionObject -eq $null -or $nodeVersionObject.Major -lt 22) { throw 'Bundled Node.js 22 runtime is not healthy after extraction.' }
 $nodeHealth = 'passed'
@@ -442,7 +449,7 @@ try {
         # Keep the existing lock identity, but never reuse a partial extraction
         # as a completed deployment. No npm or lifecycle downloads run here.
         if (Test-Path -LiteralPath $hyperframesMarker -PathType Leaf) { Remove-Item -LiteralPath $hyperframesMarker }
-        Expand-Archive -LiteralPath $hyperframesCliZip -DestinationPath $hyperframesRoot -Force
+        Expand-BundledZip $hyperframesCliZip $hyperframesRoot
     }
     if (-not (Test-Path -LiteralPath $hyperframesEntry -PathType Leaf)) { throw 'Bundled HyperFrames CLI entry is missing after extraction.' }
     Set-InstallProgress 'runtime.hyperframesCliCheck'
@@ -471,7 +478,7 @@ try {
     Set-InstallProgress 'runtime.hyperframesBrowser'
     # --version can succeed with missing ICU/resources. Restore these files
     # during explicit setup even when the browser EXE already exists.
-    Expand-Archive -LiteralPath $hyperframesBrowserZip -DestinationPath $hyperframesBrowserRoot -Force
+    Expand-BundledZip $hyperframesBrowserZip $hyperframesBrowserRoot
     Set-InstallProgress 'runtime.hyperframesBrowserCheck'
     $browserProbe = @'
 const [entry, executablePath, expectedVersion] = process.argv.slice(1);

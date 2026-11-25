@@ -891,6 +891,7 @@ mod imp {
         command_line: *mut u16,
         environment: *const c_void,
         startup: STARTUPINFOW,
+        flags: u32,
     ) -> std::io::Result<PROCESS_INFORMATION> {
         let attributes = ProcThreadAttributeList::with_parent_process(parent_process)?;
         let mut startup_ex = STARTUPINFOEXW::default();
@@ -905,7 +906,7 @@ mod imp {
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
-                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | flags,
                 environment,
                 std::ptr::null(),
                 &startup_ex.StartupInfo,
@@ -1236,31 +1237,36 @@ mod imp {
         arguments: &[OsString],
         environment_overrides: &[(OsString, OsString)],
     ) -> std::io::Result<Option<DesktopUserChild>> {
-        if !process_is_elevated().map_err(|error| {
-            contextual_win32_error(
-                "desktop-token launch decision",
-                "process_is_elevated",
-                error,
-            )
-        })? {
-            return Ok(None);
-        }
+        spawn_worker(exe, arguments, environment_overrides, None)
+    }
 
-        let shell = desktop_shell_token().map_err(|error| {
-            contextual_win32_error("desktop token acquisition", "desktop_shell_token", error)
-        })?;
-        let token = &shell.token;
-        let launch_method = desktop_process_launch_method(shell.kind);
-        let mut raw_environment = std::ptr::null_mut();
-        if unsafe { CreateEnvironmentBlock(&mut raw_environment, token.raw(), 0) } == 0 {
-            return Err(contextual_win32_error(
-                "desktop environment creation",
-                "CreateEnvironmentBlock",
-                std::io::Error::last_os_error(),
-            ));
-        }
-        let raw_environment = EnvironmentBlock(raw_environment);
-        let base_entries = unsafe { copy_environment_entries(raw_environment.0.cast::<u16>()) }?;
+    pub(super) fn spawn_worker(
+        exe: &Path, arguments: &[OsString], environment_overrides: &[(OsString, OsString)],
+        job: Option<std::os::windows::io::BorrowedHandle<'_>>,
+    ) -> std::io::Result<Option<DesktopUserChild>> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::{JobObjects::AssignProcessToJobObject, Threading::{CREATE_SUSPENDED, ResumeThread}};
+        let elevated = process_is_elevated().map_err(|error| contextual_win32_error(
+            "desktop-token launch decision", "process_is_elevated", error))?;
+        if !elevated && job.is_none() { return Ok(None); }
+        let shell = elevated.then(desktop_shell_token).transpose().map_err(|error|
+            contextual_win32_error("desktop token acquisition", "desktop_shell_token", error))?;
+        let base_entries = if let Some(shell) = &shell {
+            let mut raw_environment = std::ptr::null_mut();
+            if unsafe { CreateEnvironmentBlock(&mut raw_environment, shell.token.raw(), 0) } == 0 {
+                return Err(contextual_win32_error("desktop environment creation", "CreateEnvironmentBlock", std::io::Error::last_os_error()));
+            }
+            let block = EnvironmentBlock(raw_environment);
+            unsafe { copy_environment_entries(block.0.cast::<u16>()) }?
+        } else {
+            std::env::vars_os().map(|(k, v)| {
+                let mut entry = k.encode_wide().collect::<Vec<_>>();
+                entry.push(b'=' as u16);
+                entry.extend(v.encode_wide());
+                entry
+            }).collect()
+        };
+        let flags = if job.is_some() { CREATE_SUSPENDED } else { 0 };
         let mut overrides = environment_overrides
             .iter()
             .map(|(key, value)| {
@@ -1313,10 +1319,12 @@ mod imp {
         // named-desktop ACL check in the elevated launch path.
         let startup = desktop_user_startup_info();
         let mut process_info = PROCESS_INFORMATION::default();
+        let launch_method = shell.as_ref().map(|s| desktop_process_launch_method(s.kind));
         let launch_api = match launch_method {
-            DesktopProcessLaunchMethod::ParentProcess => "CreateProcessW (desktop Shell parent)",
-            DesktopProcessLaunchMethod::WithToken => "CreateProcessWithTokenW",
-            DesktopProcessLaunchMethod::AsUser => "CreateProcessAsUserW (desktop Shell token)",
+            None => "CreateProcessW (current user)",
+            Some(DesktopProcessLaunchMethod::ParentProcess) => "CreateProcessW (desktop Shell parent)",
+            Some(DesktopProcessLaunchMethod::WithToken) => "CreateProcessWithTokenW",
+            Some(DesktopProcessLaunchMethod::AsUser) => "CreateProcessAsUserW (desktop Shell token)",
         };
         log::info!(
             "launching managed Codex exe={} api={} command_line_utf16_units={}",
@@ -1325,9 +1333,11 @@ mod imp {
             command_line.len()
         );
         let created = match launch_method {
-            DesktopProcessLaunchMethod::ParentProcess => {
+            None => unsafe { CreateProcessW(exe_wide.as_ptr(), command_line.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 0,
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | flags, environment.as_ptr().cast(), std::ptr::null(), &startup, &mut process_info) },
+            Some(DesktopProcessLaunchMethod::ParentProcess) => {
                 let parent_process =
-                    OwnedHandle::new(unsafe { OpenProcess(PROCESS_CREATE_PROCESS, 0, shell.pid) })
+                    OwnedHandle::new(unsafe { OpenProcess(PROCESS_CREATE_PROCESS, 0, shell.as_ref().unwrap().pid) })
                         .ok_or_else(|| {
                             contextual_win32_error(
                                 "desktop parent process open",
@@ -1340,32 +1350,32 @@ mod imp {
                     exe_wide.as_ptr(),
                     command_line.as_mut_ptr(),
                     environment.as_ptr().cast::<c_void>(),
-                    startup,
+                    startup, flags,
                 )?;
                 1
             }
-            DesktopProcessLaunchMethod::AsUser => unsafe {
+            Some(DesktopProcessLaunchMethod::AsUser) => unsafe {
                 CreateProcessAsUserW(
-                    token.raw(),
+                    shell.as_ref().unwrap().token.raw(),
                     exe_wide.as_ptr(),
                     command_line.as_mut_ptr(),
                     std::ptr::null(),
                     std::ptr::null(),
                     0,
-                    CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | flags,
                     environment.as_ptr().cast::<c_void>(),
                     std::ptr::null(),
                     &startup,
                     &mut process_info,
                 )
             },
-            DesktopProcessLaunchMethod::WithToken => unsafe {
+            Some(DesktopProcessLaunchMethod::WithToken) => unsafe {
                 CreateProcessWithTokenW(
-                    token.raw(),
+                    shell.as_ref().unwrap().token.raw(),
                     0,
                     exe_wide.as_ptr(),
                     command_line.as_mut_ptr(),
-                    CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | flags,
                     environment.as_ptr().cast::<c_void>(),
                     std::ptr::null(),
                     &startup,
@@ -1379,6 +1389,19 @@ mod imp {
                 launch_api,
                 std::io::Error::last_os_error(),
             ));
+        }
+        if let Some(job) = job {
+            // Join before the first instruction so even the earliest descendants inherit the job.
+            if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process_info.hProcess) } == 0
+                || unsafe { ResumeThread(process_info.hThread) } == u32::MAX {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    windows_sys::Win32::System::Threading::TerminateProcess(process_info.hProcess, 1);
+                    windows_sys::Win32::Foundation::CloseHandle(process_info.hThread);
+                    windows_sys::Win32::Foundation::CloseHandle(process_info.hProcess);
+                }
+                return Err(error);
+            }
         }
         Ok(Some(desktop_user_child_from_process_info(process_info)?))
     }
@@ -3327,7 +3350,7 @@ ConvertTo-Json -Compress -InputObject $helpers
                 executable_wide.as_ptr(),
                 command_line.as_mut_ptr(),
                 environment.as_ptr().cast::<c_void>(),
-                desktop_user_startup_info(),
+                desktop_user_startup_info(), 0,
             )
             .unwrap();
             let mut child = desktop_user_child_from_process_info(process_info).unwrap();
@@ -3733,6 +3756,15 @@ pub(crate) use imp::{
     wait_for_process_exit, wait_for_usable_window_for_root_with_process, DesktopUserChild,
     ProcessTimes,
 };
+
+#[cfg(windows)]
+pub fn run_in_desktop_job(exe: &std::path::Path, arguments: &[std::ffi::OsString],
+    environment: &[(std::ffi::OsString, std::ffi::OsString)], job: std::os::windows::io::BorrowedHandle<'_>) -> std::io::Result<u32> {
+    let child = imp::spawn_worker(exe, arguments, environment, Some(job))?
+        .ok_or_else(|| std::io::Error::other("desktop job worker missing"))?;
+    imp::wait_for_process_exit(child.raw_process_handle(), u32::MAX)?
+        .ok_or_else(|| std::io::Error::other("desktop job worker did not exit"))
+}
 
 /// Wait for the worker in the interactive user's security context.
 #[cfg(windows)]

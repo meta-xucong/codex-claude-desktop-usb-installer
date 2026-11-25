@@ -706,6 +706,8 @@ if ($ClaudeMediaSource) {
     }
     $worker = [IO.File]::ReadAllText((Join-Path $repo 'src-tauri\src\app\claude_desktop.ps1')).Replace("`r`n","`n")
     [IO.File]::WriteAllText((Join-Path $dest 'claude-desktop-worker.ps1'), $worker, [Text.UTF8Encoding]::new($true))
+    $stage = [IO.File]::ReadAllText((Join-Path $repo 'src-tauri\src\app\claude_stage_desktop.ps1')).Replace("`r`n","`n")
+    [IO.File]::WriteAllText((Join-Path $dest 'claude-desktop-stage.ps1'), $stage, [Text.UTF8Encoding]::new($true))
     $usbManifest.claudeDesktop = [ordered]@{distribution='official-exe';desktop='6.28899.2.0';code='2.1.328'}
 }
 [System.IO.File]::WriteAllText((Join-Path $output "usb-manifest.json"), ($usbManifest | ConvertTo-Json -Depth 8), $utf8NoBom)

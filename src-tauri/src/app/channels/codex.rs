@@ -193,8 +193,21 @@ struct LocalBundleSnapshot {
 struct CodexUpdatePayload {
     #[serde(flatten)]
     identity: CodexPayloadIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checked_license_digest: Option<String>,
     #[serde(default)]
     local_snapshot: Option<LocalBundleSnapshot>,
+}
+
+impl CodexUpdatePayload {
+    fn require_checked_license(&self, current_digest: &str) -> Result<(), AppError> {
+        if self.checked_license_digest.as_deref() != Some(current_digest) {
+            return Err(AppError::StaleExpectation(
+                "确认更新的 U 盘或许可证已变化，请重新检查。".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1610,7 +1623,6 @@ fn require_supported_manifest_schemas(
     Ok(root_schema)
 }
 
-#[cfg(test)]
 fn local_bundle_snapshot(
     bundle_root: &Path,
     local: &LocalBundle,
@@ -1634,7 +1646,8 @@ fn local_bundle_snapshot(
         current_version: local.current_version.clone(),
         payload_relative: local.payload_relative.clone(),
         architecture: local.architecture.clone(),
-        payload_sha256: digest(&local.payload_path, "payload")?,
+        // Discovery records the claim; apply compares it with the actual file digest.
+        payload_sha256: require_sha256(local.manifest.pointer("/payload/sha256"), "manifest.payload.sha256")?,
         root_manifest_sha256: digest(&root_manifest, ROOT_MANIFEST_NAME)?,
         usb_manifest_sha256: digest(&usb_manifest, USB_MANIFEST_NAME)?,
         checksums_sha256: digest(&checksums, SHA256SUMS_NAME)?,
@@ -1702,24 +1715,8 @@ fn codex_update_payload(
 ) -> Result<serde_json::Value, AppError> {
     serde_json::to_value(CodexUpdatePayload {
         identity: identity.clone(),
+        checked_license_digest: None,
         local_snapshot: Some(local_bundle_snapshot(bundle_root, local)?),
-    })
-    .map_err(|error| AppError::Engine(format!("序列化 codex 更新快照失败: {error}")))
-}
-
-fn codex_update_payload_with_digests(
-    bundle_root: &Path,
-    local: &LocalBundle,
-    identity: &CodexPayloadIdentity,
-    digests: &BTreeMap<String, String>,
-) -> Result<serde_json::Value, AppError> {
-    serde_json::to_value(CodexUpdatePayload {
-        identity: identity.clone(),
-        local_snapshot: Some(local_bundle_snapshot_from_digests(
-            bundle_root,
-            local,
-            digests,
-        )?),
     })
     .map_err(|error| AppError::Engine(format!("序列化 codex 更新快照失败: {error}")))
 }
@@ -3426,7 +3423,7 @@ fn check_inner(
     };
     require_windows()?;
     let mut deferred_cleanup = None;
-    {
+    let checked_license_digest = {
         let _operation = CODEX_UPDATE_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -3486,13 +3483,12 @@ fn check_inner(
             // staging tree. The update and cleanup paths revalidate after this lock.
             recover_pending_transactions(&ctx.bundle_root)?;
         }
-    }
+        initial_authorization.map(|a| a.license_digest)
+    };
     if let Some(request) = deferred_cleanup {
         return request.cleanup_and_reject().map(|_| None);
     }
-    // Read only the capability metadata first. The full removable-drive
-    // integrity pass is intentionally delayed until after remote resolution,
-    // so an unavailable source is not hidden behind a long local hash.
+    // Discovery reads release metadata. Apply verifies the installed files before writing.
     let local_metadata = if reactivation_reinstall {
         require_capability_metadata_for_reinstall(&ctx.bundle_root)
     } else {
@@ -3537,37 +3533,16 @@ fn check_inner(
             return Err(error);
         }
     };
-    log::info!(
-        "codex payload update check stage=integrity start architecture={} current={}",
-        local.architecture,
-        local.current_version
-    );
-    let verified_digests = if reactivation_reinstall {
-        None
-    } else {
-        let verified_digests = match verify_bundle_integrity_with_digests(&ctx.bundle_root) {
-            Ok(digests) => digests,
-            Err(error) => {
-                log::error!(
-                    "codex payload update check failed stage=integrity current={} code={} error={}",
-                    local.current_version,
-                    error.code(),
-                    error
-                );
-                return Err(error);
-            }
-        };
-        let payload_sha = verified_digest(&verified_digests, &local.payload_relative, "payload")?;
-        let payload_size = fs::metadata(&local.payload_path)
-            .map_err(|error| AppError::Engine(format!("读取 payload 大小失败: {error}")))?
-            .len();
-        verify_metadata_values(&ctx.bundle_root, &payload_sha, payload_size)?;
-        log::info!(
-            "codex payload update check stage=integrity completed files={}",
-            verified_digests.len()
-        );
-        Some(verified_digests)
-    };
+    checked_update_offer(&ctx.bundle_root, local, fresh, checked_license_digest, reactivation_reinstall)
+}
+
+fn checked_update_offer(
+    root: &Path,
+    local: LocalBundle,
+    fresh: Option<ResolvedRelease>,
+    checked_license_digest: Option<String>,
+    reactivation_reinstall: bool,
+) -> Result<Option<UpdateInfo>, AppError> {
     let Some(fresh) = fresh else {
         log::info!(
             "codex payload update check completed stage=compare result=no-update reason=source_no_newer current={}",
@@ -3596,16 +3571,15 @@ fn check_inner(
         fresh.identity.source_kind.as_str(),
         fresh.msix.size
     );
-    let payload = match verified_digests.as_ref() {
-        Some(digests) => {
-            codex_update_payload_with_digests(&ctx.bundle_root, &local, &fresh.identity, digests)?
-        }
-        None => serde_json::to_value(CodexUpdatePayload {
-            identity: fresh.identity.clone(),
-            local_snapshot: None,
-        })
-        .map_err(|error| AppError::Engine(format!("序列化重装更新对象失败: {error}")))?,
-    };
+    let payload = serde_json::to_value(CodexUpdatePayload {
+        identity: fresh.identity.clone(),
+        checked_license_digest,
+        local_snapshot: if reactivation_reinstall {
+            None
+        } else {
+            Some(local_bundle_snapshot(root, &local)?)
+        },
+    }).map_err(|error| AppError::Engine(format!("序列化更新确认对象失败: {error}")))?;
     Ok(Some(UpdateInfo {
         channel: ChannelKind::Codex,
         current_version: local.current_version,
@@ -3807,6 +3781,7 @@ fn apply_inner(
         error
     })?;
     let expected_payload = parse_codex_update_payload(&expected.payload)?;
+    expected_payload.require_checked_license(&current_authorization.license_digest)?;
     let expected_identity = expected_payload.identity;
     let expected_snapshot = if reactivation_reinstall {
         if expected_payload.local_snapshot.is_some() {
@@ -5618,6 +5593,33 @@ mod tests {
         )
         .unwrap();
         assert!(require_local_snapshot(&root, &local, &snapshot).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovery_defers_file_reads_and_apply_rejects_a_corrupt_payload_or_changed_license() {
+        let root = v2_fixture();
+        let local = require_capability_metadata(&root).unwrap();
+        let release = fake_resolved_release();
+        let license = "original-test-license".to_string();
+        fs::write(&local.payload_path, b"damaged").unwrap();
+        #[cfg(windows)]
+        let locked = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new().read(true).share_mode(0).open(&local.payload_path).unwrap()
+        };
+        let offer = checked_update_offer(
+            &root, local.clone(), Some(release), Some(license.clone()), false,
+        ).unwrap().unwrap();
+        let expected = parse_codex_update_payload(&offer.payload).unwrap();
+        expected.require_checked_license(&license).unwrap();
+        assert!(expected.require_checked_license("different-test-license").is_err());
+        #[cfg(windows)]
+        drop(locked);
+        assert!(verify_bundle_integrity_with_digests(&root).is_err());
+        // Without an update, even the small SHA256SUMS confirmation file is unnecessary.
+        fs::remove_file(root.join(SHA256SUMS_NAME)).unwrap();
+        assert!(checked_update_offer(&root, local, None, Some(license), false).unwrap().is_none());
         let _ = fs::remove_dir_all(root);
     }
 

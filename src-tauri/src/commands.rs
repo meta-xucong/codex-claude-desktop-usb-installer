@@ -1308,6 +1308,7 @@ pub async fn historical_pick_local_package(
 pub async fn offline_payload_probe(
     state: State<'_, ManagerState>,
     package_path: Option<String>,
+    preview_only: Option<bool>,
 ) -> Result<OfflinePayloadReport, CommandError> {
     if !matches!(state.target.os, OperatingSystem::Windows) {
         return Err(AppError::UnsupportedPlatform.into());
@@ -1317,6 +1318,9 @@ pub async fn offline_payload_probe(
     let expected_architecture = state.target.arch.as_str().to_string();
     let package_path = package_path.map(PathBuf::from);
     tauri::async_runtime::spawn_blocking(move || {
+        if preview_only == Some(true) && package_path.is_none() {
+            return crate::app::offline_payload::preview_offline_payload(&executable, &expected_architecture);
+        }
         probe_offline_payload(
             &executable,
             package_path.as_deref(),
@@ -2415,14 +2419,26 @@ pub fn confirm_quit(
 /// command: an armed in-process handoff is the proof that a helper is waiting
 /// for this exact manager lifetime.
 #[tauri::command]
-pub fn get_uninstall_handoff(state: State<'_, ManagerState>) -> Option<UninstallHandoffStatus> {
-    state
-        .uninstall_handoff()
-        .map(|handoff| UninstallHandoffStatus {
-            id: handoff.id,
-            report_path: handoff.report_path,
-            message: handoff.message,
-        })
+pub async fn get_uninstall_handoff(state: State<'_, ManagerState>) -> Result<Option<UninstallHandoffStatus>, CommandError> {
+    let pending = state.pending_uninstall_profile.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(pending) = pending.as_ref() {
+        return Ok(Some(UninstallHandoffStatus {
+            id: pending.id.clone(),
+            message: pending.message.clone(),
+            report_path: String::new(),
+            profile_retry: true,
+        }));
+    }
+    Ok(state.uninstall_handoff().map(UninstallHandoffStatus::from))
+}
+
+pub(crate) struct PendingUninstallProfile {
+    id: String,
+    message: String,
+    notes: Vec<String>,
+    purge_ccswitch_data: bool,
+    force_cleanup: bool,
+    guard: DetachedGuard,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2431,6 +2447,66 @@ pub struct UninstallHandoffStatus {
     pub id: String,
     pub report_path: String,
     pub message: String,
+    pub profile_retry: bool,
+}
+
+impl From<UninstallHandoff> for UninstallHandoffStatus {
+    fn from(handoff: UninstallHandoff) -> Self {
+        Self { id: handoff.id, report_path: handoff.report_path, message: handoff.message, profile_retry: false }
+    }
+}
+
+/// Leaving the retry screen releases the original lease without deleting anything.
+#[tauri::command]
+pub fn dismiss_uninstall_profile_retry(
+    state: State<'_, ManagerState>, retry_id: String,
+) -> Result<(), CommandError> {
+    let mut slot = state.pending_uninstall_profile.try_lock()
+        .map_err(|_| AppError::Busy("卸载数据清理正在执行".into()))?;
+    if slot.as_ref().is_some_and(|p| p.id == retry_id) {
+        slot.take();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn retry_uninstall_profile(
+    app: AppHandle, retry_id: String, confirm: bool,
+) -> Result<UninstallHandoffStatus, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ManagerState>();
+        let mut slot = state.pending_uninstall_profile.try_lock()
+            .map_err(|_| AppError::Busy("卸载数据清理正在执行".into()))?;
+        let pending = slot.as_mut().filter(|p| confirm && p.id == retry_id)
+            .ok_or_else(|| AppError::Busy("本次卸载数据清理已结束或尚未确认".into()))?;
+        let token = pending.guard.token_clone().ok_or(OperationError::InvalidToken)
+            .map_err(destructive_token_error)?;
+        pending.guard.operations.validate_with_phase(&token, OperationPhase::Committing)
+            .map_err(destructive_token_error)?;
+        let mut notes = pending.notes.clone();
+        let result = crate::app::win_update::purge_bundle_codex_profile(&mut notes).and_then(|_| {
+            crate::app::uninstall_cleanup::launch_deferred_cleanup(
+                true, pending.purge_ccswitch_data, pending.force_cleanup, false, None, notes,
+            ).map_err(AppError::Engine)
+        });
+        let helper = match result {
+            Ok(helper) => helper,
+            Err(error) => {
+                pending.guard.set_phase(OperationPhase::Preparing);
+                pending.message = error.to_string();
+                return Err(error.into());
+            }
+        };
+        let handoff = UninstallHandoff {
+            id: helper.handoff_id, report_path: helper.report_path, message: helper.message,
+        };
+        if !state.arm_uninstall_handoff(handoff.clone()) {
+            return Err(AppError::Busy("已有卸载清理交接正在等待退出".into()).into());
+        }
+        crate::app::usb_guard::suppress_status_for_uninstall();
+        slot.take();
+        Ok(handoff.into())
+    }).await.map_err(|e| AppError::Internal(format!("join: {e}")))?
 }
 
 /// Acknowledge the exact pending helper handoff and request a controlled exit.
@@ -3366,8 +3442,21 @@ pub async fn usb_claude_prepare(app: AppHandle, state: State<'_, ManagerState>) 
 }
 
 #[tauri::command]
-pub async fn usb_claude_update(state: State<'_, ManagerState>) -> Result<bool, CommandError> {
-    run_claude_operation(state, OperationKind::Update, |_| crate::app::claude_desktop::update()).await
+pub async fn usb_claude_check_update() -> Result<serde_json::Value, CommandError> {
+    tauri::async_runtime::spawn_blocking(crate::app::claude_desktop::check_update).await
+        .map_err(|e| AppError::Internal(e.to_string()))?.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn usb_claude_update(app: AppHandle, state: State<'_, ManagerState>, expected: String) -> Result<bool, CommandError> {
+    let operations = state.operations.clone();
+    run_claude_operation(state, OperationKind::Update, move |op| crate::app::claude_desktop::update(&expected, |stage| {
+        let detail = format!("update:{stage}");
+        let _ = operations.set_progress(op.token(), OperationProgress {
+            downloaded: 0, total: 0, source: format!("claude-desktop:{detail}"),
+        });
+        let _ = app.emit("claude-desktop://progress", &detail);
+    })).await
 }
 
 async fn run_claude_operation<T: Send + 'static>(state: State<'_, ManagerState>, kind: OperationKind,
@@ -3447,12 +3536,12 @@ pub async fn win_launch_codex(
             let home = crate::app::usb_guard::local_data_paths()?.codex_home;
             let focused = codex_win_engine::sys::try_focus_live_usb_session(&root, &home, || {
                 crate::app::usb_guard::authorize_live_usb_focus(&root)?;
-                crate::app::usb_host::ensure_ready_for_open(Some(&config), false)
+                crate::app::usb_host::ensure_account_for_open(&config)
             })?;
             if focused { return Ok(()); }
         }
     }
-    crate::app::usb_host::ensure_ready_for_open(Some(&config), true)?;
+    crate::app::usb_host::ensure_account_for_open(&config)?;
     let persisted = PersistedAppSettings::load();
     let settings = windows_domain_settings_for_persisted(&state);
     let codex_locale = locale
@@ -3531,15 +3620,17 @@ pub fn usb_guard_status() -> UsbGuardStatus {
 }
 
 #[tauri::command]
-pub async fn usb_host_status() -> Result<crate::app::usb_host::UsbHostStatus, CommandError> {
-    let result = tauri::async_runtime::spawn_blocking(crate::app::usb_host::status)
+pub async fn usb_host_status(overview: Option<bool>) -> Result<crate::app::usb_host::UsbHostStatus, CommandError> {
+    let started = std::time::Instant::now();
+    let overview = overview.unwrap_or(false);
+    let result = tauri::async_runtime::spawn_blocking(move || crate::app::usb_host::status_for_view(overview))
         .await
         .map_err(|e| AppError::Internal(format!("join: {e}")))
         .and_then(|result| result);
     match &result {
         Ok(host) if host.required => log::info!(
-            "USB host status pid={} ready={} account_ready={} capabilities_ready={}",
-            std::process::id(), host.ready, host.account_ready, host.capabilities_ready
+            "USB host status pid={} ready={} account_ready={} capabilities_ready={} overview={} elapsed_ms={}",
+            std::process::id(), host.ready, host.account_ready, host.capabilities_ready, overview, started.elapsed().as_millis()
         ),
         Err(error) => log::warn!("USB host status failed pid={} code={}", std::process::id(), error.code()),
         _ => {}
@@ -3557,7 +3648,7 @@ pub async fn initialize_usb_host(
 ) -> Result<crate::app::usb_host::UsbHostStatus, CommandError> {
     let op = begin_guard(&state, OperationKind::Install)?;
     crate::app::usb_guard::require_usb_content_access("usb-host-initialize")?;
-    if !crate::app::usb_guard::guard_required() { return usb_host_status().await; }
+    if !crate::app::usb_guard::guard_required() { return usb_host_status(None).await; }
     let token = op.token().clone();
     let operations = state.operations.clone();
     operations.set_phase(&token, OperationPhase::Finishing)
@@ -3583,11 +3674,12 @@ pub async fn initialize_usb_host(
         // process on the next Launch request.
         crate::app::model_catalog::mark_restart_required()?;
         crate::app::codex_config_guard::ensure_user_config_ready()?;
-        crate::app::usb_host::complete_initialization(|| {
+        let setup = crate::app::usb_host::complete_initialization(|| {
           if !before.capabilities_ready {
             stage("capabilities");
             let home = crate::app::usb_guard::local_data_paths()?.codex_home;
             let config = crate::app::usb_host::read_config(&home)?;
+            let config = crate::app::capability_pack::migrate_pack_shells(&home, config)?;
             if crate::app::capability_pack::host_core_ready(&home, &config)? {
                 crate::app::capability_pack::refresh_media_authorization(&home)?;
             } else {
@@ -3597,7 +3689,9 @@ pub async fn initialize_usb_host(
           }
           Ok(())
         }, || {
-          if !crate::app::usb_host::status()?.account_ready {
+          let home = crate::app::usb_guard::local_data_paths()?.codex_home;
+          let config = crate::app::usb_host::read_config(&home)?;
+          if crate::app::usb_host::bound_account_state(&home, &config)? != crate::app::usb_host::AccountState::Ready {
             stage("account");
             let report = crate::app::ccswitch::initialize_host_account(&app, replace_account)?;
             if report.account_injection_status != "verified" {
@@ -3605,10 +3699,16 @@ pub async fn initialize_usb_host(
             }
           }
           Ok(())
-        })?;
+        });
         stage("verify");
         let after = crate::app::usb_host::status()?;
-        if !after.ready { return Err(AppError::Engine(after.message)); }
+        if !after.account_ready {
+            setup?;
+            return Err(AppError::UsbHostNotReady(after.message));
+        }
+        if let Err(error) = setup {
+            log::warn!("USB initialization needs attention: {}", error.code());
+        }
         log::info!("USB host initialization completed");
         Ok(after)
     }).await.map_err(|e| AppError::Internal(format!("join: {e}")))?.map_err(Into::into)
@@ -3651,26 +3751,50 @@ pub fn media_model_settings() -> crate::app::media_generation::LocalMediaModelSe
 pub async fn manage_native_model_catalog(
     request: crate::app::model_catalog::NativeModelCatalogActionRequest,
 ) -> Result<crate::app::model_catalog::NativeModelCatalogActionReport, CommandError> {
-    let sync_models = request.operation == "reset" || request.model_id.as_deref()
-        .is_some_and(|id| id.strip_prefix("anthropic/").unwrap_or(id).starts_with("claude-"));
-    let mut report = crate::app::model_catalog::manage_native_model_catalog(request).await?;
-    if sync_models && matches!(report.status.as_str(), "already_added" | "applied_restart_pending" | "already_native") {
-        if let Err(error) = sync_claude_capabilities("models").await {
-            log::warn!("Claude model list sync incomplete: {}", error.code);
-            report.error_code = Some("claude-sync-pending".into());
-        }
-    }
-    Ok(report)
+    Ok(crate::app::model_catalog::manage_native_model_catalog(request).await?)
 }
 
-async fn sync_claude_capabilities(part: &'static str) -> Result<(), CommandError> {
+#[tauri::command]
+pub async fn manage_claude_models(webview: tauri::Webview, operation: String, model: Option<String>, binding: Option<String>, on_stage: Option<tauri::ipc::JavaScriptChannelId>) -> Result<serde_json::Value, CommandError> {
+    #[cfg(windows)]
+    return tauri::async_runtime::spawn_blocking(move || {
+        let adding = operation == "add";
+        let on_stage = on_stage.map(|id| id.channel_on(webview));
+        let started = std::time::Instant::now();
+        let id = model.as_deref().filter(|s| crate::app::model_diagnostics::safe_identifier(s)).unwrap_or("<redacted>");
+        let mut stage = "prepare";
+        if adding { log::info!("Claude model add model={id} stage={stage}"); }
+        let result = crate::app::claude_desktop::models::manage(&operation, model.as_deref(), binding.as_deref(), |next| {
+            stage = next;
+            if let Some(channel) = &on_stage { let _ = channel.send(next); }
+        });
+        if adding {
+            let outcome = match &result {
+                Ok(view) if view["ready"] == false => "not-ready",
+                Ok(_) => "ok",
+                Err(e) => e.code(),
+            };
+            log::info!("Claude model add model={id} stage={stage} result={outcome} elapsed_ms={}", started.elapsed().as_millis());
+        }
+        result
+    })
+        .await.map_err(|e| AppError::Internal(format!("join: {e}")))?.map_err(Into::into);
+    #[cfg(not(windows))]
+    Err(AppError::UnsupportedPlatform.into())
+}
+
+async fn sync_claude_capabilities(part: &'static str) -> Result<&'static str, CommandError> {
     tauri::async_runtime::spawn_blocking(move || crate::app::claude_desktop::sync_if_installed(part))
         .await.map_err(|error| AppError::Internal(format!("join: {error}")))?.map_err(Into::into)
 }
 
 #[tauri::command]
-pub async fn usb_claude_sync_skills() -> Result<(), CommandError> {
-    sync_claude_capabilities("skills").await
+pub async fn usb_claude_sync_skills(scope: Option<String>) -> Result<&'static str, CommandError> {
+    let part = match scope.as_deref() {
+        None | Some("skills") => "skills", Some("connections") => "connections", Some("capabilities") => "capabilities",
+        _ => return Err(AppError::Engine("未知同步范围".into()).into())
+    };
+    sync_claude_capabilities(part).await
 }
 
 /// Windows-only: install the bundled Codex Switch configurator and start it.
@@ -3739,9 +3863,9 @@ pub async fn account_redeem(code: String) -> Result<AccountStatus, CommandError>
 /// profile.  The pack is optional in development builds, but a release USB
 /// bundle is expected to ship it under content/codex-starter-kit.
 #[tauri::command]
-pub async fn capability_pack_status(app: AppHandle) -> Result<CapabilityPackReport, CommandError> {
+pub async fn capability_pack_status(app: AppHandle, include_connections: Option<bool>) -> Result<CapabilityPackReport, CommandError> {
     crate::app::usb_guard::require_usb_content_access("capability-pack-status")?;
-    tauri::async_runtime::spawn_blocking(move || capability_pack_status_impl(&app))
+    tauri::async_runtime::spawn_blocking(move || capability_pack_status_impl(&app, include_connections == Some(true)))
         .await
         .map_err(|error| AppError::Internal(format!("join: {error}")))?
         .map_err(Into::into)
@@ -3769,10 +3893,15 @@ pub async fn install_capability_pack(
                 crate::app::capability_pack::host_install_options(&home)?
             } else { options }
         } else { options };
-        let connection_only = options.feishu_action == Some(crate::app::capability_pack::FeishuConnectionAction::Apply);
-        let report = install_capability_pack_impl(&app, options)?;
-        if report.installed {
-            crate::app::claude_desktop::sync_if_installed(if connection_only { "connections" } else { "capabilities" })?;
+        let connection_only = options.connection_edits.is_some()
+            || options.feishu_action == Some(crate::app::capability_pack::FeishuConnectionAction::Apply);
+        let mut report = install_capability_pack_impl(&app, options)?;
+        if report.installed && !matches!(report.config_status.as_str(), "failed" | "partial" | "conflict") {
+            report.claude_sync = match crate::app::claude_desktop::sync_if_installed(if connection_only { "connections" } else { "capabilities" }) {
+                Ok("not_applicable") => None,
+                Ok(status) => Some(status),
+                Err(err) => { log::warn!("Claude capability sync: {err}"); Some("failed") }
+            };
         }
         Ok::<_, AppError>(report)
     })
@@ -4335,6 +4464,7 @@ pub async fn win_uninstall(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WinBundleUninstallReport {
+    pub profile_retry_id: Option<String>,
     pub success: bool,
     pub codex: Option<WinUninstallReport>,
     pub codex_error: Option<String>,
@@ -4470,6 +4600,7 @@ fn combine_bundle_uninstall(
             .is_some_and(|report| report.purged_user_data);
 
     WinBundleUninstallReport {
+        profile_retry_id: None,
         success,
         codex,
         codex_error,
@@ -4534,6 +4665,44 @@ fn bundle_can_start_final_cleanup(report: &WinBundleUninstallReport) -> bool {
         && !report.outcome.is_partial()
         && report.outcome.steps_are_terminal()
         && report.outcome.recovery_actions.is_empty()
+}
+
+/// A data-only retry can continue straight to the exit handoff only when all
+/// non-profile work has already succeeded.
+fn purge_uninstalled_bundle_profile(
+    report: &mut WinBundleUninstallReport,
+    requested: bool,
+    purge: impl FnOnce(&mut Vec<String>) -> Result<bool, AppError>,
+) {
+    if !requested || !report.ccswitch.as_ref().is_some_and(|r| r.success) {
+        return;
+    }
+    let ready_for_handoff = bundle_can_start_final_cleanup(report);
+    let Some(primary) = report.codex.as_mut().filter(|r| r.success && r.outcome.primary_ok) else {
+        return;
+    };
+    match purge(&mut report.notes) {
+        Ok(removed) => {
+            report.purged_user_data = removed;
+            primary.purged_user_data = removed;
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            primary.success = false;
+            primary.outcome.cleanup = StepOutcome::failed(detail.clone());
+            primary.outcome.push_recovery(recovery::PURGE_USER_DATA);
+            primary.notes.push(detail.clone());
+            if ready_for_handoff {
+                report.profile_retry_id = Some(uuid::Uuid::new_v4().to_string());
+            }
+            report.success = false;
+            report.notes.push(detail.clone());
+            if report.outcome.cleanup.state != "failed" {
+                report.outcome.cleanup = StepOutcome::failed(detail);
+            }
+            report.outcome.push_recovery(recovery::PURGE_USER_DATA);
+        }
+    }
 }
 
 fn defer_shared_bundle_cleanup(report: &mut WinBundleUninstallReport, detail: &str) {
@@ -4926,6 +5095,7 @@ pub async fn win_uninstall_bundle(
                 }
             }
         }
+        purge_uninstalled_bundle_profile(&mut report, purge_user_data, crate::app::win_update::purge_bundle_codex_profile);
         if bundle_can_start_final_cleanup(&report) {
             match crate::app::uninstall_cleanup::launch_deferred_cleanup(
                 purge_user_data,
@@ -4956,6 +5126,18 @@ pub async fn win_uninstall_bundle(
     })
     .await
     .map_err(|e| AppError::Internal(format!("join: {e}")))?;
+    if let Some(id) = &report.profile_retry_id {
+        _op.set_phase(OperationPhase::Preparing);
+        *state.pending_uninstall_profile.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(PendingUninstallProfile {
+                id: id.clone(),
+                message: report.message.clone(),
+                notes: report.notes.clone(),
+                purge_ccswitch_data,
+                force_cleanup,
+                guard: _op,
+            });
+    }
     if report.cleanup_pending {
         // Return the truthful handoff state and keep the manager alive until
         // the renderer has shown it. The helper already holds the session
@@ -5182,6 +5364,65 @@ mod tests {
             false,
         );
         assert!(super::bundle_can_start_final_cleanup(&report));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bundle_profile_checkpoint_requires_only_data_to_be_pending() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // The production purge reads these four locations from the environment.
+        // Run it in its own process so concurrent tests cannot observe the fixture.
+        let fixture_id = std::env::var("CAM_TEST_UNINSTALL_PROFILE_ID").ok();
+        let id = fixture_id.as_deref().map(|s| uuid::Uuid::parse_str(s).unwrap())
+            .unwrap_or_else(uuid::Uuid::new_v4);
+        let root = std::env::temp_dir().join(format!("codex-profile-retry-{id}"));
+        let local = root.join("Local");
+        let roaming = root.join("Roaming");
+        if fixture_id.is_none() {
+            std::fs::create_dir(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "commands::tests::bundle_profile_checkpoint_requires_only_data_to_be_pending"])
+                .env("CAM_TEST_UNINSTALL_PROFILE_ID", id.to_string())
+                .env("USERPROFILE", &root).env("HOME", &root)
+                .env("LOCALAPPDATA", &local).env("APPDATA", &roaming)
+                .status().unwrap();
+            assert!(status.success());
+            std::fs::remove_dir(root).unwrap();
+            return;
+        }
+        for (key, expected) in [("USERPROFILE", &root), ("HOME", &root),
+                                ("LOCALAPPDATA", &local), ("APPDATA", &roaming)] {
+            assert_eq!(std::env::var_os(key).as_deref(), Some(expected.as_os_str()));
+        }
+        let profile = local.join("CodexAppManager").join("usb-codex-home");
+        std::fs::create_dir_all(&profile).unwrap();
+        let data = profile.join("logs.sqlite");
+        let keep = root.join("project.txt");
+        std::fs::write(&keep, b"project").unwrap();
+        std::fs::write(&data, b"local fixture").unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(1).open(&data).unwrap();
+        let purge = crate::app::win_update::purge_bundle_codex_profile;
+        let make = || super::combine_bundle_uninstall(
+            Ok(uninstall_fixture(true)), Ok(switch_uninstall_fixture(true)), true, true,
+        );
+        let mut report = make();
+        super::purge_uninstalled_bundle_profile(&mut report, true, purge);
+        assert!(report.profile_retry_id.is_some());
+        assert!(!report.success && report.outcome.primary_ok && !report.cleanup_pending);
+        let mut other_failure = make();
+        other_failure.success = false;
+        other_failure.outcome.cleanup = super::StepOutcome::failed("staging");
+        super::purge_uninstalled_bundle_profile(&mut other_failure, true, |_| Err(super::AppError::Engine("locked".into())));
+        assert!(other_failure.profile_retry_id.is_none());
+        assert_eq!(other_failure.outcome.cleanup.detail.as_deref(), Some("staging"));
+        drop(lock);
+        assert!(purge(&mut vec![]).unwrap());
+        assert!(!profile.exists());
+        assert_eq!(std::fs::read(&keep).unwrap(), b"project");
+        assert!(!purge(&mut vec![]).unwrap());
+        std::fs::remove_file(keep).unwrap();
+        std::fs::remove_dir(local.join("CodexAppManager")).unwrap();
+        std::fs::remove_dir(local).unwrap();
     }
 
     #[test]

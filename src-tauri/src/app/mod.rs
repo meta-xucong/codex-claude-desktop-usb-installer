@@ -8,6 +8,8 @@ pub(crate) mod capability_config;
 pub mod ccswitch;
 pub mod channels;
 pub mod claude_desktop;
+#[cfg(windows)]
+pub(crate) mod claude_session;
 pub mod codex_agents_hint;
 pub mod codex_config_guard;
 pub(crate) mod codex_config_readback;

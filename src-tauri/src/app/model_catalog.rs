@@ -793,6 +793,7 @@ pub struct NativeModelCatalogActionRequest {
 pub struct NativeModelCatalogActionReport {
     pub status: String,
     pub model_ids: Vec<String>,
+    pub default_model: Option<String>,
     pub restart_required: bool,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1203,6 +1204,7 @@ fn action_report(
     NativeModelCatalogActionReport {
         status: status.to_owned(),
         model_ids,
+        default_model: None,
         restart_required: restart_required(),
         message: message.to_owned(),
         error_code: None,
@@ -1214,7 +1216,18 @@ fn action_report(
     }
 }
 
+#[cfg(test)]
 fn catalog_state_for_home(home: &Path) -> Result<NativeModelCatalogActionReport, AppError> {
+    read_catalog_state(home, None)
+}
+
+#[cfg(windows)]
+fn native_panel_seed() -> Result<Value, AppError> {
+    model_native_probe::native_default_catalog(&uuid::Uuid::new_v4().to_string(), &AtomicBool::new(false),
+        Instant::now() + Duration::from_secs(120)).map_err(|e| engine(format!("读取 Codex 原生模型目录失败（{}）", e.code())))
+}
+
+fn read_catalog_state(home: &Path, load_native: Option<fn() -> Result<Value, AppError>>) -> Result<NativeModelCatalogActionReport, AppError> {
     let _files = FILE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let config = config_path_for(home);
     let catalog = catalog_path_for(home);
@@ -1226,30 +1239,51 @@ fn catalog_state_for_home(home: &Path) -> Result<NativeModelCatalogActionReport,
         .map_err(|_| engine("Codex 配置不是 UTF-8"))?
         .unwrap_or("");
     let (_, managed) = cleaned_config_without_external_catalog(text, &config)?;
+    let document: toml::Value = toml::from_str(text.trim_start_matches('\u{feff}')).map_err(|_| engine("Codex 配置无法解析"))?;
+    let profile = super::codex_config_readback::selected_profile(&document).map_err(engine)?;
+    let current = super::codex_config_readback::effective_string(&document, profile, "model").map(str::to_owned);
+    let report = |ids, message| NativeModelCatalogActionReport { default_model: current.clone(), ..action_report("ok", ids, message) };
     if !managed {
         // The catalog file is inert unless the exact manager block references
         // it. Reset intentionally leaves detached files in place so an
         // external config writer or a preserved config backup can never be
         // left pointing at a path that this process deleted.
-        return Ok(action_report(
-            "ok",
-            Vec::new(),
-            "当前没有启用由管理器添加的上游模型",
-        ));
+        let prepared = PREPARED_NATIVE_CATALOG.lock().unwrap_or_else(|e| e.into_inner());
+        let ids = match prepared.as_ref().filter(|(path, _)| path == home) {
+            Some((_, seed)) => catalog_model_ids(seed)?,
+            None if load_native.is_some() => {
+                drop(prepared);
+                drop(_files);
+                let seed = load_native.expect("guard requires a native catalog loader")()?;
+                let ids = catalog_model_ids(&seed)?;
+                if ids.is_empty() || ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
+                    return Err(engine("本机 Codex 原生目录为空或含重复型号"));
+                }
+                *PREPARED_NATIVE_CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some((home.to_owned(), seed));
+                // The native query releases the configuration lock. A concurrent save takes precedence.
+                return read_catalog_state(home, None);
+            }
+            None => Vec::new(),
+        };
+        return Ok(report(ids, "当前没有启用由管理器添加的上游模型，使用原生模型目录"));
     }
     let catalog_bytes = read_optional(&catalog)?;
     let Some(bytes) = catalog_bytes else {
         return Err(engine("模型目录配置存在但文件缺失；请先复位模型目录"));
     };
     let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| engine("本地模型目录格式无效；已保留原文件"))?;
+        serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)).map_err(|_| engine("本地模型目录格式无效；已保留原文件"))?;
     let ids = catalog_model_ids(&value)?;
-    Ok(action_report("ok", ids, "已读取当前启用的上游模型目录"))
+    Ok(report(ids, "已读取当前启用的上游模型目录"))
 }
 
 fn catalog_state() -> Result<NativeModelCatalogActionReport, AppError> {
     let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
-    let mut report = catalog_state_for_home(&home)?;
+    #[cfg(windows)]
+    let loader = Some(native_panel_seed as fn() -> Result<Value, AppError>);
+    #[cfg(not(windows))]
+    let loader = None;
+    let mut report = read_catalog_state(&home, loader)?;
     if let Some(binding) = usb_guard::authorized_account_binding().ok().flatten() {
         if let Ok(base) = provider_base(&binding.ccswitch.provider_id) {
             report.connection_fingerprint = Some(crate::app::gateway_model_probe::binding_digest(
@@ -1752,7 +1786,7 @@ fn prepare_model_add(
     if !needs_seed {
         return Ok(action_report("ready", Vec::new(), "模型目录已就绪"));
     }
-    if let Some((prepared_home, _)) = PREPARED_NATIVE_CATALOG
+    if let Some((prepared_home, seed)) = PREPARED_NATIVE_CATALOG
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .as_ref()
@@ -1760,7 +1794,7 @@ fn prepare_model_add(
         if prepared_home == &home {
             return Ok(action_report(
                 "ready",
-                Vec::new(),
+                catalog_model_ids(seed)?,
                 "Codex 默认模型目录已准备",
             ));
         }
@@ -2224,6 +2258,97 @@ fn ensure_reset_not_pending(home: &Path) -> Result<(), AppError> {
     }
 }
 
+const DEFAULTS_FILE: &str = "codex-usb-model-defaults.json";
+
+#[derive(Serialize, Deserialize)]
+struct ModelPreference {
+    original: Option<String>,
+    applied: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<String>,
+}
+
+impl ModelPreference {
+    fn owns(&self, current: Option<&str>) -> bool {
+        current.is_some_and(|id| self.applied == id || self.previous.as_deref() == Some(id))
+    }
+}
+
+type Preferences = BTreeMap<String, ModelPreference>;
+
+fn preferences(home: &Path) -> Result<Preferences, AppError> {
+    read_optional(&home.join(DEFAULTS_FILE))?.map_or(Ok(Preferences::new()), |bytes|
+        serde_json::from_slice(&bytes).map_err(|_| engine("无法读取原有模型偏好记录")))
+}
+
+fn preference_scope(text: &str) -> Result<(toml_edit::Document, String), AppError> {
+    let doc = text.trim_start_matches('\u{feff}').parse::<toml_edit::Document>().map_err(|_| engine("Codex 配置无法解析"))?;
+    let name = match doc.get("profile") {
+        None => String::new(),
+        Some(value) => value.as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| engine("活动 profile 无效"))?.trim().to_owned()
+    };
+    if !name.is_empty() && doc.get("profiles").and_then(|p| p.get(&name)).and_then(|p| p.as_table_like()).is_none() {
+        return Err(engine("活动 profile 不存在"));
+    }
+    Ok((doc, name))
+}
+
+fn preference_table<'a>(doc: &'a mut toml_edit::Document, name: &str) -> &'a mut dyn toml_edit::TableLike {
+    if name.is_empty() { doc.as_table_mut() } else { doc["profiles"][name].as_table_like_mut().expect("validated profile") }
+}
+
+fn write_model(table: &mut dyn toml_edit::TableLike, value: Option<&str>) {
+    if let Some(id) = value {
+        let mut item = toml_edit::Value::from(id);
+        if let Some(old) = table.get("model").and_then(|v| v.as_value()) {
+            *item.decor_mut() = old.decor().clone();
+        }
+        table.insert("model", toml_edit::Item::Value(item));
+    } else { table.remove("model"); }
+}
+
+fn set_model_default_at(home: &Path, id: &str, mark_restart: impl Fn() -> Result<(), AppError>) -> Result<(), AppError> {
+    let _files = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _process = model_selection_client::lock_configuration().map_err(|_| engine("Codex 配置正在修改"))?;
+    ensure_reset_not_pending(home)?;
+    let config = config_path_for(home);
+    let text = fs::read_to_string(&config).map_err(|_| engine("Codex 配置无法读取"))?;
+    let (_, managed) = cleaned_config_without_external_catalog(&text, &config)?;
+    let ids = if managed {
+        let catalog: Value = serde_json::from_slice(&read_optional(&catalog_path_for(home))?.unwrap_or_default()).map_err(|_| engine("目录无法解析"))?;
+        catalog_model_ids(&catalog)?
+    } else {
+        let seed = PREPARED_NATIVE_CATALOG.lock().unwrap_or_else(|e| e.into_inner());
+        catalog_model_ids(&seed.as_ref().filter(|(path, _)| path == home).ok_or_else(|| engine("请先读取本端原生模型目录"))?.1)?
+    };
+    if !ids.iter().any(|s| s == id) { return Err(engine("该模型尚未加入 Codex")); }
+    let (mut doc, scope) = preference_scope(&text)?;
+    let inherited = doc.get("model").and_then(|v| v.as_str()).map(str::to_owned);
+    let table = preference_table(&mut doc, &scope);
+    let old = table.get("model").and_then(|v| v.as_str()).map(str::to_owned);
+    let mut saved = preferences(home)?;
+    if old.as_ref().or(inherited.as_ref()).map(String::as_str) == Some(id) {
+        if saved.get(&scope).is_some_and(|r| r.applied == id) { mark_restart()?; }
+        return Ok(());
+    }
+    let previous = saved.get(&scope).and_then(|s| old.as_ref().filter(|id| s.owns(Some(id))).cloned());
+    let original = match (&previous, saved.get(&scope)) {
+        (Some(_), Some(record)) => record.original.clone(),
+        _ => old,
+    };
+    saved.insert(scope.clone(), ModelPreference { original, applied: id.into(), previous });
+    write_model(table, Some(id));
+    let save_preference = |values: &Preferences| {
+        let receipt = serde_json::to_vec(values).map_err(|_| engine("无法保存默认模型归属"))?;
+        atomic_file::write_atomic_preserving_backup(&home.join(DEFAULTS_FILE), &receipt).map_err(|_| engine("无法保存默认模型归属"))
+    };
+    if read_optional(&config)?.as_deref() != Some(text.as_bytes()) { return Err(engine("配置已更改，请重试")); }
+    save_preference(&saved)?;
+    atomic_file::write_atomic_preserving_backup(&config, doc.to_string().as_bytes()).map_err(|_| engine("无法保存 Codex 默认模型"))?;
+    if saved.get_mut(&scope).and_then(|s| s.previous.take()).is_some() { save_preference(&saved)?; }
+    mark_restart()
+}
+
 fn reset_owned_catalog() -> Result<NativeModelCatalogActionReport, AppError> {
     *PREPARED_NATIVE_CATALOG
         .lock()
@@ -2304,6 +2429,15 @@ where
         .map_err(|_| {
         engine("检测到外部模型目录配置或配置无法安全解析，已保留原配置；未恢复 Codex 原生目录")
     })?;
+    let mut saved = preferences(home)?;
+    let (mut doc, scope) = preference_scope(&cleaned_config)?;
+    let preference = saved.remove(&scope);
+    let table = preference_table(&mut doc, &scope);
+    let restore = preference.as_ref().filter(|p| p.owns(table.get("model").and_then(|v| v.as_str())));
+    let (cleaned_config, managed) = if let Some(p) = restore {
+        write_model(table, p.original.as_deref());
+        (doc.to_string(), true)
+    } else { (cleaned_config, managed) };
     let config_backup_snapshot = read_optional(&config_backup)?;
     let catalog_snapshot = read_optional(&catalog)?;
     let sidecar_snapshot = read_optional(&sidecar)?;
@@ -2453,6 +2587,10 @@ where
         ));
     }
 
+    if preference.is_some() {
+        let bytes = serde_json::to_vec(&saved).map_err(|_| engine("无法更新默认模型记录"))?;
+        write_atomic(&home.join(DEFAULTS_FILE), &bytes).map_err(|_| engine("请重试清理默认模型记录"))?;
+    }
     remove_file(&reset_pending)
         .map_err(|_| engine("模型目录已清理，但恢复标记无法移除；请再次执行恢复默认"))?;
     if read_optional(&reset_pending)?.is_some() {
@@ -2477,7 +2615,14 @@ pub async fn manage_native_model_catalog(
     request: NativeModelCatalogActionRequest,
 ) -> Result<NativeModelCatalogActionReport, AppError> {
     match request.operation.as_str() {
-        "state" => catalog_state(),
+        "state" => tauri::async_runtime::spawn_blocking(catalog_state).await
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+        "default" => {
+            let home = codex_home_dir().ok_or_else(|| engine("无法确定 Codex 用户目录"))?;
+            let id = request.model_id.as_deref().ok_or_else(|| engine("请选择模型"))?;
+            set_model_default_at(&home, id, mark_restart_required)?;
+            catalog_state()
+        }
         "prepare" => {
             let request_id = request
                 .request_id
@@ -4365,6 +4510,35 @@ mod tests {
     }
 
     #[test]
+    fn scoped_default_reset_preserves_profile_inheritance_external_edits_and_other_client() {
+        for external in [false, true] {
+            let home = CatalogTempHome::new();
+            let dir = home.path();
+            let path = config_path_for(dir);
+            let mut config = managed_catalog_config(dir);
+            config.extend_from_slice(b"model = 'inherited' # keep\nprofile = 'work'\n[profiles.work]\nmodel_reasoning_effort = 'high'\n[profiles.private]\nmodel = 'mine'\n");
+            fs::write(&path, &config).unwrap();
+            fs::write(catalog_path_for(dir), fixture_catalog("gpt-6.1-terra")).unwrap();
+            let other = dir.join("claude-profile.json");
+            fs::write(&other, b"personal").unwrap();
+            set_model_default_at(dir,"gpt-6.1-terra",|| Ok(())).unwrap();
+            assert_eq!(catalog_state_for_home(dir).unwrap().default_model.as_deref(), Some("gpt-6.1-terra"));
+            if external {
+                let changed = fs::read_to_string(&path).unwrap().replace("model = \"gpt-6.1-terra\"", "model = \"external\"");
+                fs::write(&path,changed).unwrap();
+            }
+            reset_owned_catalog_at(dir, || Ok(())).unwrap();
+            let text = fs::read_to_string(path).unwrap();
+            assert!(text.contains("# keep"));
+            let result: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(result["profiles"]["work"].get("model").and_then(|v|v.as_str()),external.then_some("external"));
+            assert_eq!(result["model"].as_str(),Some("inherited"));
+            assert_eq!(result["profiles"]["private"]["model"].as_str(),Some("mine"));
+            assert_eq!(fs::read(other).unwrap(),b"personal");
+        }
+    }
+
+    #[test]
     fn bundled_terra_migrates_old_catalog_once_without_changing_selection_or_entries() {
         let home = CatalogTempHome::new();
         let config = config_path_for(home.path());
@@ -5789,6 +5963,19 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&config).unwrap(), original_config);
         assert_eq!(std::fs::read(&catalog).unwrap(), empty);
+    }
+
+    #[test]
+    fn reopened_panel_recovers_native_membership_without_writing_config() {
+        let home = CatalogTempHome::new();
+        let config = config_path_for(home.path());
+        std::fs::write(&config, "model = 'native-test'").unwrap();
+        let first = read_catalog_state(home.path(), Some(|| Ok(json!({"identity":CATALOG_IDENTITY,"models":[{"slug":"native-test"}]})))).unwrap();
+        assert_eq!(first.model_ids, ["native-test"]);
+        assert_eq!(first.default_model.as_deref(), Some("native-test"));
+        let cached = read_catalog_state(home.path(), Some(|| panic!("unexpected second native query"))).unwrap();
+        assert_eq!(first, cached);
+        assert_eq!(std::fs::read_to_string(config).unwrap(), "model = 'native-test'");
     }
 
     #[test]

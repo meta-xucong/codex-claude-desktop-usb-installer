@@ -157,20 +157,35 @@ def squirrel_resource(stream):
     return offset(rva, size), size
 
 
-def squirrel_code(exe, version, scratch):
-    # Keep the nested archives on disk so the relay doesn't hold three copies in RAM.
-    with exe.open("rb") as source, tempfile.TemporaryFile(dir=scratch) as outer:
-        start, size = squirrel_resource(source)
-        source.seek(start)
-        while size:
-            part = source.read(min(size, 1024*1024))
-            if not part:
-                raise ValueError("truncated Squirrel resource")
-            outer.write(part)
-            size -= len(part)
-        with zipfile.ZipFile(outer) as dist, tempfile.TemporaryFile(dir=scratch) as inner:
-            with dist.open(f"AnthropicClaude-{version}-full.nupkg") as payload:
-                shutil.copyfileobj(payload, inner)
+class PEResource:
+    """Seekable view of an embedded ZIP. Both nested ZIPs stay in the original EXE."""
+    def __init__(self, stream, start, size):
+        self.stream, self.start, self.size = stream, start, size
+        self.seek(0)
+
+    def tell(self):
+        return self.stream.tell() - self.start
+
+    def seek(self, offset, whence=0):
+        base = (0, self.tell(), self.size)[whence]
+        position = base + offset
+        if position < 0 or position > self.size:
+            raise OSError("seek outside installer resource")
+        self.stream.seek(self.start + position)
+        return position
+
+    def seekable(self):
+        return True
+
+    def read(self, size=-1):
+        remaining = self.size - self.tell()
+        return self.stream.read(remaining if size < 0 else min(size, remaining))
+
+
+def squirrel_code(exe, version):
+    with exe.open("rb") as source:
+        view = PEResource(source, *squirrel_resource(source))
+        with zipfile.ZipFile(view) as dist, dist.open(f"AnthropicClaude-{version}-full.nupkg") as inner:
             with zipfile.ZipFile(inner) as pkg:
                 return code_binding(pkg.read("lib/net45/resources/app.asar"))
 
@@ -206,16 +221,19 @@ def publish_squirrel(export, pair):
     version = desktop.rsplit(".",1)[0]
     url, digest = official_squirrel(version)
     reserve = relay.read_json(Path(relay.DEFAULT_CONFIG))["min_free_bytes"]
-    if shutil.disk_usage(channel).free < reserve + 1200*1024*1024:
-        raise OSError("not enough space for Squirrel media and temporary archives")
     with tempfile.TemporaryDirectory(dir=channel,prefix=".staging-") as temp:
         stage = Path(temp)
         exe = stage/"desktop.exe"
         with urllib.request.urlopen(url,timeout=120) as src, exe.open("xb") as dst:
+            length = int(src.headers["Content-Length"] or 0)
+            if length <= 0 or shutil.disk_usage(channel).free < reserve + length:
+                raise OSError("not enough space for the official installer above relay reserve")
             shutil.copyfileobj(src,dst)
+            if dst.tell() != length:
+                raise ValueError("incomplete official installer")
         if relay.sha256_file(exe) != digest:
             raise ValueError("official EXE digest mismatch")
-        code, archive, size = squirrel_code(exe, version, stage)
+        code, archive, size = squirrel_code(exe, version)
         source = export/desktop/"code.zst"
         if (code,archive) != (pair["code"],pair["archive"]) or source.stat().st_size != size or relay.sha256_file(source) != archive:
             raise ValueError("EXE requests a different Code archive")

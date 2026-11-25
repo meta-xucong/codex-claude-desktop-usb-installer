@@ -2257,38 +2257,32 @@ fn startup_preflight_impl(complete_integrity: bool) -> Result<StartupPreflight, 
         .fingerprint
         .as_ref()
         .ok_or_else(|| engine("usb_license_media_invalid：当前介质必须是可移动 NTFS U 盘"))?;
-    let license_reason = match read_license(&bundle) {
-        Err(error) => Some(format!(
+    let license = match read_license(&bundle) {
+        Err(error) => Err(format!(
             "usb_license_invalid：启动前许可证读取失败：{error}"
         )),
         Ok(Some(license)) => match validate_license(&license, fingerprint) {
-            Err(error) => Some(format!(
+            Err(error) => Err(format!(
                 "usb_license_invalid：启动前许可证校验失败：{error}"
             )),
-            Ok(signed) if signed_required() && !signed => {
-                Some("usb_license_unsigned：SignedRequired 启动前拒绝未签名许可证".to_string())
+            Ok(false) if signed_required() => {
+                Err("usb_license_unsigned：SignedRequired 启动前拒绝未签名许可证".to_string())
             }
-            Ok(_) if signed_required() && license.key_id.is_none() => Some(
+            Ok(_) if signed_required() && license.key_id.is_none() => Err(
                 "usb_license_missing_key_id：SignedRequired 启动前拒绝缺少 keyId 的许可证"
                     .to_string(),
             ),
-            Ok(_) => None,
+            Ok(signed) => Ok(Some((license, signed))),
         },
         Ok(None) if signed_required() => {
-            Some("usb_license_missing：SignedRequired 启动前缺少 usb-license.json".to_string())
+            Err("usb_license_missing：SignedRequired 启动前缺少 usb-license.json".to_string())
         }
-        Ok(None) => None,
+        Ok(None) => Ok(None),
     };
-    let revocation_restriction = if license_reason.is_none() {
-        match read_license(&bundle) {
-            Ok(Some(license)) => match validate_license(&license, fingerprint) {
-                Ok(signed) => local_revocation_preflight(&bundle, &license, fingerprint, signed),
-                Err(_) => None,
-            },
-            _ => None,
-        }
-    } else {
-        None
+    let (license_reason, revocation_restriction) = match license {
+        Ok(Some((license, signed))) => (None, local_revocation_preflight(&bundle, &license, fingerprint, signed)),
+        Ok(None) => (None, None),
+        Err(reason) => (Some(reason), None),
     };
     let recovery_layout_validated = revocation_restriction
         .as_ref()
@@ -3595,7 +3589,21 @@ pub(crate) fn handle_startup_revocation_decision_for_test(
 
 #[cfg(target_os = "windows")]
 pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
-    let result = start_for_manager_inner();
+    start_manager_guard(false)
+}
+
+#[cfg(target_os = "windows")]
+pub fn start_for_manager_on_open() -> Result<UsbGuardStatus, AppError> {
+    start_manager_guard(true)
+}
+
+#[cfg(target_os = "windows")]
+fn start_manager_guard(allow_installed_reopen: bool) -> Result<UsbGuardStatus, AppError> {
+    let started = std::time::Instant::now();
+    let result = start_for_manager_inner(allow_installed_reopen);
+    log::info!("USB check stage=guard_total pid={} manager_open={} result={} elapsed_ms={}",
+        std::process::id(), allow_installed_reopen,
+        result.as_ref().map(|status| status.status.as_str()).unwrap_or("error"), started.elapsed().as_millis());
     if crate::app::usb_revocation::has_pending_revocation() {
         ensure_pending_revocation_retry_worker();
     }
@@ -4286,7 +4294,40 @@ fn retry_pending_revocation_once() -> Result<(), AppError> {
 }
 
 #[cfg(target_os = "windows")]
-fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
+fn startup_install_is_current(bundle: &Path, local: &Path, store: &super::provenance::ProvenanceStore) -> bool {
+    if ![local.join("install-transactions"), local.join("msix-policy-transactions"), bundle.join(".staging")]
+        .iter().all(|dir| match fs::read_dir(dir) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) => e.kind() == io::ErrorKind::NotFound,
+        })
+    {
+        return false;
+    }
+    let Some(installed) = codex_win_engine::detect_portable_install(&usb_codex_root(bundle)) else {
+        return false;
+    };
+    !installed.app_version_unavailable
+        && store.managed.iter().any(|record| {
+            record.source == "manager-installed-usb-portable"
+                && record.build == codex_win_engine::version_key(&installed.version)
+                && codex_win_engine::same_windows_path(Path::new(&record.path), Path::new(&installed.path))
+        })
+        && super::offline_payload::declared_desktop_version(&bundle.join("CodexAppManager.exe"))
+            .is_ok_and(|version| version == installed.version)
+}
+
+#[cfg(target_os = "windows")]
+fn timed_integrity<T>(mode: &str, verify: impl FnOnce() -> Result<T, AppError>) -> Result<T, AppError> {
+    let started = std::time::Instant::now();
+    let result = verify();
+    log::info!("USB check stage=integrity pid={} mode={mode} ok={} elapsed_ms={}",
+        std::process::id(), result.is_ok(), started.elapsed().as_millis());
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn start_for_manager_inner(allow_installed_reopen: bool) -> Result<UsbGuardStatus, AppError> {
+    let binding_started = std::time::Instant::now();
     let executable =
         std::env::current_exe().map_err(|error| engine(format!("无法确定安装器路径: {error}")))?;
     let Some(bundle_root) = bundle_root_for_executable(&executable) else {
@@ -4375,6 +4416,8 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
         }
     };
 
+    log::info!("USB check stage=binding pid={} signed={} elapsed_ms={}",
+        std::process::id(), signed, binding_started.elapsed().as_millis());
     let mut revocation_state =
         if revocation_policy == crate::app::usb_revocation::RegistrationPolicy::LegacyUnenrolled {
             "remote_unenrolled".to_string()
@@ -4423,11 +4466,11 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
                 | Some(crate::app::usb_revocation::Decision::StatusConflict { .. })
         );
         let recovery_report = if has_revoked_history {
-            match crate::app::usb_bundle::verify_revocation_recovery_bundle(
+            match timed_integrity("revoked_history", || crate::app::usb_bundle::verify_revocation_recovery_bundle(
                 &observed_bundle_root,
                 &license,
                 &fingerprint,
-            ) {
+            )) {
                 Ok(report) => Some(report),
                 Err(error) => {
                     let status = revocation_restricted_status(
@@ -4477,11 +4520,31 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
             }
         }
 
-        // When there is no outstanding revoked decision or missing payload,
-        // require the complete signed bundle before making the online check.
-        // A valid revoked receipt is the only reason to use the recovery view.
         if !locally_revoked && !recovery_payload_missing {
-            if let Err(error) = verify_runtime_bundle_integrity(&observed_bundle_root) {
+            // Only an ordinary reopen can defer install media to its consumer.
+            // Keep the live registration, online decision and lease below for both paths.
+            let reopen = allow_installed_reopen
+                && signed_required()
+                && signed
+                && fingerprint.anchor_schema == ANCHOR_SCHEMA_V3
+                && snapshot.has_verified_host_receipt
+                && !has_revoked_history
+                && matches!(snapshot.decision, Some(crate::app::usb_revocation::Decision::ActiveOffline { .. }))
+                && super::paths::data_dir().is_some_and(|local| startup_install_is_current(
+                    &observed_bundle_root, &local, &super::provenance::ProvenanceStore::load(),
+                ));
+            let checked = timed_integrity(if reopen { "installed" } else { "full" }, || {
+                let anchor = if reopen {
+                    super::usb_bundle::verify_installed_launch(&observed_bundle_root)?.0
+                } else {
+                    verify_runtime_bundle_integrity(&observed_bundle_root)?.anchor_sha256
+                };
+                if !anchor.eq_ignore_ascii_case(&fingerprint.anchor_sha256) {
+                    return Err(engine("启动校验期间 U 盘清单发生变化"));
+                }
+                Ok(())
+            });
+            if let Err(error) = checked {
                 let status = revocation_restricted_status(
                     &observation,
                     &fingerprint,
@@ -4496,11 +4559,11 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
             integrity_verified = true;
         }
 
-        let decision = match crate::app::usb_revocation::check_startup(
-            &observed_bundle_root,
-            &license,
-            &fingerprint,
-        ) {
+        let started = std::time::Instant::now();
+        let decision = crate::app::usb_revocation::check_startup(&observed_bundle_root, &license, &fingerprint);
+        log::info!("USB check stage=revocation pid={} decision_received={} elapsed_ms={}",
+            std::process::id(), decision.is_ok(), started.elapsed().as_millis());
+        let decision = match decision {
             Ok(decision) => decision,
             Err(error) => {
                 let status = revocation_restricted_status(
@@ -4607,7 +4670,7 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
                 return finish_restricted_start(status);
             }
         }
-    } else if let Err(error) = verify_runtime_bundle_integrity(&observed_bundle_root) {
+    } else if let Err(error) = timed_integrity("legacy", || verify_runtime_bundle_integrity(&observed_bundle_root)) {
         let mut status = base_status("mismatch", "not-running");
         status.removable = true;
         status.drive_root = observation.drive_root;
@@ -4625,7 +4688,7 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
     // Higher active receipts may reopen Codex only after the full immutable
     // tree has been restored and independently verified.
     if !integrity_verified {
-        if let Err(error) = verify_runtime_bundle_integrity(&observed_bundle_root) {
+        if let Err(error) = timed_integrity("restored", || verify_runtime_bundle_integrity(&observed_bundle_root)) {
             let status = revocation_restricted_status(
                 &observation,
                 &fingerprint,
@@ -4686,6 +4749,7 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
     // This stop is also required when the helper binary bytes are unchanged:
     // a previous manager instance may still own the lock and otherwise cause
     // the new manager to publish a false `running` status.
+    let started = std::time::Instant::now();
     stop_previous_guard_for_refresh()?;
     let local_binary = ensure_local_guard_binary(&executable)?;
     write_lease(&lease)?;
@@ -4696,6 +4760,8 @@ fn start_for_manager_inner() -> Result<UsbGuardStatus, AppError> {
     // otherwise the first click can race the helper and fail at the backend
     // lease gate even though the USB signature is valid.
     let helper_ready = spawn_result.is_ok() && wait_for_guard_helper_ready();
+    log::info!("USB check stage=watchdog pid={} ready={} elapsed_ms={}",
+        std::process::id(), helper_ready, started.elapsed().as_millis());
     let mut status = base_status(
         "authorized",
         if helper_ready {
@@ -4752,7 +4818,15 @@ pub fn start_for_manager() -> Result<UsbGuardStatus, AppError> {
     Ok(status)
 }
 
+#[cfg(windows)]
+pub(super) fn claude_session_lease(identity: &str) -> Result<Uuid, AppError> {
+    read_lease().filter(|lease| lease.owner_pid == std::process::id() && lease.license_digest.as_deref() == Some(identity))
+        .and_then(|lease| Uuid::parse_str(&lease.lease_id).ok()).ok_or_else(|| engine("Claude 当前 U 盘租约已结束。"))
+}
+
 pub fn stop_for_manager() {
+    #[cfg(windows)]
+    super::claude_session::release();
     stop_revocation_cleanup_retry_worker();
     stop_pending_revocation_retry_worker();
     remove_lease();
@@ -4974,6 +5048,7 @@ pub fn run_guard_cli() {
         status.managed_processes = lease.managed_processes.clone();
         let _ = write_json_atomic(&status_file, &status);
         if let Some(failure) = terminal {
+            super::claude_session::stop_lease(&lease.lease_id);
             if !matches!(&failure, WatchdogFailure::Missing) {
                 let owner_pid = lease.owner_pid;
                 lease.managed_processes
@@ -5035,6 +5110,30 @@ pub fn guard_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a disposable unpacked Windows Codex release fixture"]
+    fn installed_startup_matches_local_build_and_excludes_recovery() {
+        let root = PathBuf::from(std::env::var_os("USB_OPEN_TEST_INSTALLED_BUNDLE").unwrap());
+        let local = root.join("test-local");
+        assert!(local.is_dir() && root.join("disposable-test-root").is_file());
+        let installed = codex_win_engine::detect_portable_install(&usb_codex_root(&root)).unwrap();
+        let mut store = crate::app::provenance::ProvenanceStore::default();
+        assert!(!startup_install_is_current(&root, &local, &store));
+        store.record(installed.path.clone(), codex_win_engine::version_key(&installed.version), "manager-installed-usb-portable");
+        assert!(startup_install_is_current(&root, &local, &store));
+        for journal_dir in [root.join(".staging"), local.join("install-transactions"), local.join("msix-policy-transactions")] {
+            fs::create_dir_all(&journal_dir).unwrap();
+            let journal = journal_dir.join("recovery.json");
+            fs::write(&journal, b"pending").unwrap();
+            assert!(!startup_install_is_current(&root, &local, &store));
+            fs::remove_file(journal).unwrap();
+        }
+        assert!(startup_install_is_current(&root, &local, &store));
+        store.managed[0].build += 1;
+        assert!(!startup_install_is_current(&root, &local, &store));
+    }
 
     #[cfg(windows)]
     #[test]

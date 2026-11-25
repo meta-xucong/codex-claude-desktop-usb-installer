@@ -16,6 +16,7 @@ vi.mock("../../services/managerApi", async (importOriginal) => {
       capabilityPackStatus: vi.fn(),
       installCapabilityPack: vi.fn(),
       installAndLaunchCcswitch: vi.fn(),
+      usbClaudeSyncSkills: vi.fn(),
       mediaModelCatalog: vi.fn(),
       mediaModelSettings: vi.fn(),
     },
@@ -130,6 +131,26 @@ describe("OfflineComponentsSheet", () => {
     });
   });
 
+  it("preserves unrelated connections and retries only Claude after a partial save", async () => {
+    const user = userEvent.setup();
+    api.capabilityPackStatus.mockResolvedValue({ ...PACK_REPORT, connectionSettings: {
+      remote: ["linear"], api: ["dashscope-web-search"], media: true, dashscopeConfigured: true,
+      dashscopeBaseUrl: "https://example.invalid", dashscopeModel: "saved-model",
+    } });
+    api.installCapabilityPack.mockResolvedValue({ ...PACK_REPORT, installed: true, coreReady: true, configStatus: "merged", claudeSync: "failed" });
+    api.usbClaudeSyncSkills.mockResolvedValue("synced");
+    render(<ThemeProvider><I18nProvider><OfflineComponentsSheet open view="connections" dualEdition onDismiss={vi.fn()} /></I18nProvider></ThemeProvider>);
+    await user.click(screen.getByText("其他连接"));
+    expect(await screen.findByRole("checkbox", { name: "Linear MCP" })).toBeChecked();
+    await user.click(screen.getByRole("checkbox", { name: "Figma MCP" }));
+    await user.click(screen.getByRole("button", { name: "保存其他连接" }));
+    await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
+    expect(api.installCapabilityPack.mock.calls[0][0].connectionEdits).toEqual(["figma"]);
+    await user.click(await screen.findByRole("button", { name: "重试 Claude 同步" }));
+    expect(api.usbClaudeSyncSkills).toHaveBeenCalledWith("connections");
+    expect(api.installCapabilityPack).toHaveBeenCalledTimes(1);
+  });
+
   it("shows two Feishu inputs and enables the installed local runtime after saving", async () => {
     const user = userEvent.setup();
     api.capabilityPackStatus.mockResolvedValue({ ...PACK_REPORT, feishuRuntimeStatus: "passed" });
@@ -168,13 +189,16 @@ describe("OfflineComponentsSheet", () => {
     await user.click(screen.getByText("其他连接"));
     await screen.findByText("飞书 MCP 已启用，凭据已保存。");
     const save = screen.getByRole("button", { name: "保存其他连接" });
+    expect(save).toBeDisabled();
+    await user.click(screen.getByRole("checkbox", { name: "Figma MCP" }));
     await waitFor(() => expect(save).toBeEnabled());
     await user.click(save);
     expect(api.installCapabilityPack).toHaveBeenCalledWith(expect.objectContaining({
       feishuAction: "preserve",
       feishuAppId: "",
       feishuAppSecret: "",
-    }));
+      connectionEdits: ["figma"],
+    }), false);
   });
 
   it("shows Feishu as enabled with blank credentials and confirms live save", async () => {
@@ -237,10 +261,11 @@ describe("OfflineComponentsSheet", () => {
     expect(install).toBeDisabled();
 
     status.reject(new Error("status unavailable"));
+    await user.click(screen.getByRole("checkbox", { name: "Figma MCP" }));
     await waitFor(() => expect(install).toBeEnabled());
     await user.click(install);
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(install).toBeEnabled());
+    await waitFor(() => expect(install).toBeDisabled());
   }, 30_000);
 
   it("does not let a stale status query overwrite the install result", async () => {
@@ -258,6 +283,7 @@ describe("OfflineComponentsSheet", () => {
     await user.click(screen.getByText("其他连接"));
 
     const install = await screen.findByRole("button", { name: "保存其他连接" });
+    await user.click(screen.getByRole("checkbox", { name: "Figma MCP" }));
     await waitFor(() => expect(install).toBeEnabled());
     await user.click(install);
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
@@ -323,7 +349,7 @@ describe("OfflineComponentsSheet", () => {
         enableMediaGeneration: false,
         image2Model: "gpt-image-2.5",
         minimaxVideoModel: "",
-      }),
+      }), false,
     );
     expect(screen.queryByText("DashScope 的 Key、Base URL 和模型必须填写完整。")).not.toBeInTheDocument();
   }, 30_000);
@@ -335,7 +361,8 @@ describe("OfflineComponentsSheet", () => {
 
     expect(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" })).toBeChecked();
     expect(screen.getByText("MiniMax 视频：暂未开放")).toBeInTheDocument();
-    await user.type(screen.getByLabelText("Grok 图片模型 ID"), "grok-imagine-test");
+    expect(screen.getByLabelText("Grok 图片模型 ID")).toHaveAttribute("readonly");
+    await user.click(screen.getByRole("checkbox", { name: "Figma MCP" }));
     await user.click(screen.getByRole("button", { name: "保存其他连接" }));
 
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
@@ -364,6 +391,8 @@ describe("OfflineComponentsSheet", () => {
     await user.click(screen.getByText("其他连接"));
 
     await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: "保存其他连接" })).toBeDisabled();
+    await user.click(screen.getByRole("checkbox", { name: "Figma MCP" }));
     await user.click(screen.getByRole("button", { name: "保存其他连接" }));
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
@@ -385,6 +414,8 @@ describe("OfflineComponentsSheet", () => {
     await user.click(screen.getByText("其他连接"));
 
     await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: "保存其他连接" })).toBeDisabled();
+    await user.click(screen.getByRole("checkbox", { name: "Figma MCP" }));
     await user.click(screen.getByRole("button", { name: "保存其他连接" }));
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
@@ -402,6 +433,8 @@ describe("OfflineComponentsSheet", () => {
 
     await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
     expect(screen.getByRole("checkbox", { name: "图片与视频生成（本地 MCP）" })).toBeChecked();
+    expect(screen.getByRole("button", { name: "保存其他连接" })).toBeDisabled();
+    await user.click(screen.getByRole("checkbox", { name: "Figma MCP" }));
     await user.click(screen.getByRole("button", { name: "保存其他连接" }));
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({
@@ -420,6 +453,8 @@ describe("OfflineComponentsSheet", () => {
     await user.click(screen.getByText("其他连接"));
 
     await waitFor(() => expect(api.mediaModelCatalog).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: "保存其他连接" })).toBeDisabled();
+    await user.click(screen.getByRole("checkbox", { name: "Figma MCP" }));
     await user.click(screen.getByRole("button", { name: "保存其他连接" }));
     await waitFor(() => expect(api.installCapabilityPack).toHaveBeenCalledTimes(1));
     expect(api.installCapabilityPack.mock.calls[0]?.[0]).toMatchObject({

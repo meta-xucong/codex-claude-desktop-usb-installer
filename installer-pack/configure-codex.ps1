@@ -34,10 +34,20 @@ $withoutManaged = [regex]::Replace($existing, $managedPattern, '')
 if ($ReplaceExisting) {
     $replacementTemp = Join-Path $backupRoot ('merge-input-' + [guid]::NewGuid().ToString('N') + '.toml')
     try {
-        & $PythonExe (Join-Path $PSScriptRoot 'replace-pack-config.py') $configPath $GeneratedFragment $replacementTemp
+        $recovery = & $PythonExe (Join-Path $PSScriptRoot 'replace-pack-config.py') $configPath $GeneratedFragment $replacementTemp
+        if ($LASTEXITCODE -eq 42) {
+            $failure = [InvalidOperationException]::new('Historical model configuration has no uniquely matching model-sync backup. Existing settings were preserved.')
+            $failure.Data['UnmatchedModelBackup'] = $true
+            throw $failure
+        }
         if ($LASTEXITCODE -ne 0) { throw 'Current-package configuration replacement failed.' }
         $withoutManaged = [string](Get-Content -LiteralPath $replacementTemp -Raw -Encoding UTF8)
-        $withoutManaged = [regex]::Replace($withoutManaged, $usbAccessPattern, '')
+        if ($recovery -eq 'recovered-model-sync') {
+            # Initialization chose its defaults from the damaged file. Keep the recovered settings.
+            $EnableFullAccess = $false
+        } else {
+            $withoutManaged = [regex]::Replace($withoutManaged, $usbAccessPattern, '')
+        }
     } finally {
         if (Test-Path -LiteralPath $replacementTemp) { Remove-Item -LiteralPath $replacementTemp -Force }
     }

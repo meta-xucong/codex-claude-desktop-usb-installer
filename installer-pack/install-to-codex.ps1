@@ -23,6 +23,11 @@ param(
     [string]$MediaGatewayCatalogVerifiedAt = ''
 )
 
+# Windows PowerShell -File passes one native argument per named option.
+$EnableSkills = @($EnableSkills -split ',' | Where-Object { $_ })
+$EnabledApiServices = @($EnabledApiServices -split ',' | Where-Object { $_ })
+$EnabledRemoteMcps = @($EnabledRemoteMcps -split ',' | Where-Object { $_ })
+
 $ErrorActionPreference = 'Stop'
 if ($IncludeUnsupported -and -not $IncludeNonDefault) { throw '-IncludeUnsupported requires -IncludeNonDefault.' }
 if ($EnableFeishu -and $DisableFeishu) { throw '-EnableFeishu and -DisableFeishu are mutually exclusive.' }
@@ -485,8 +490,6 @@ function Test-RuntimeReady([object]$State) {
 
 $runtimeScript = Join-Path $PackRoot 'runtime\provision-runtime.ps1'
 if (-not (Test-Path -LiteralPath $runtimeScript -PathType Leaf)) { throw "Runtime provisioner is missing from the pack: $runtimeScript" }
-$powershellCommand = Get-Command powershell.exe -ErrorAction SilentlyContinue
-if (-not $powershellCommand) { throw 'Windows PowerShell is required to complete the Codex setup steps.' }
 $diagnosticsRoot = Join-Path $ownershipRoot 'diagnostics'
 $runtimeDiagnosticPath = Join-Path $diagnosticsRoot 'runtime-provision.log'
 $runtimeOutput = ''
@@ -685,6 +688,7 @@ if (@($EnableSkills).Count -gt 0) { $renderArguments.EnableSkills = @($EnableSki
 $configMerger = Join-Path $PackRoot 'configure-codex.ps1'
 $configDiagnosticPath = Join-Path $diagnosticsRoot 'config-merge.log'
 $configOutput = ''
+$modelBackupMissing = $false
 $renderStatus = [ordered]@{ status = 'not-run'; totalSkills = 0; enabledSkillCount = 0; disabledSkillCount = 0; enabledSkills = @(); disabledSkills = @(); reason = 'Configuration renderer did not complete.' }
 $configStatus = [ordered]@{ status = 'partial'; merged = $false; reason = 'Configuration stage did not complete.' }
 try {
@@ -704,6 +708,7 @@ try {
     $configOutput = & $configMerger @configArguments | Out-String
     $configStatus = $configOutput | ConvertFrom-Json
 } catch {
+    $modelBackupMissing = $_.Exception.Data.Contains('UnmatchedModelBackup')
     if ([string]$renderStatus.status -eq 'not-run') {
         $renderStatus.status = 'failed'
         Set-StatusReason $renderStatus (Redact-Diagnostic (($configOutput + "`n" + $_.Exception.Message).Trim()))
@@ -720,6 +725,7 @@ $modelSyncDiagnosticPath = Join-Path $diagnosticsRoot 'model-sync.log'
 $modelSyncOutput = ''
 $modelSyncStatus = [ordered]@{ schemaVersion = 1; status = 'failed'; migration = 'not-run'; preferredModel = ''; currentModel = $null; configChanged = $false; reason = 'Model sync did not complete.' }
 try {
+    if ($modelBackupMissing) { throw 'Model synchronization deferred until the existing configuration can be recovered.' }
     Set-InstallProgress 'pack.models'
     $modelSyncArguments = @{ PackRoot = $PackRoot; TargetUserProfile = $userProfile; TargetCodexHome = $codexHome; KitHome = $ownershipRoot }
     if (-not [string]::IsNullOrWhiteSpace([string]$runtimeState.python.executable)) {
@@ -748,18 +754,24 @@ $feishuApplied = $feishuEnabled -and $feishuReady -and [bool]$renderStatus.feish
 if ($feishuApplied) { $localMcpsEnabled += 'feishu' }
 if ($mediaGenerationEnabled) { $localMcpsEnabled += 'media-generation' }
 $mediaConfigPath = Join-Path $codexHome 'config.toml'
-$mediaRegistrationVerified = $false
-if ($mediaGenerationEnabled -and $renderStatus.mediaGenerationEnabled -and $configStatus.merged -and (Test-Path -LiteralPath $mediaConfigPath -PathType Leaf)) {
-    $mergedConfig = Get-Content -LiteralPath $mediaConfigPath -Raw -Encoding UTF8
-    $mediaRegistrationVerified = [regex]::IsMatch($mergedConfig, '(?m)^\[mcp_servers\.media_generation\][ \t]*\r?\nenabled[ \t]*=[ \t]*true[ \t]*(?:#.*)?\r?$')
-}
-$mediaRegistered = [bool]($mediaGenerationEnabled -and $renderStatus.mediaGenerationEnabled -and $configStatus.merged -and $mediaRegistrationVerified)
+$mediaRegistration = if (-not $mediaGenerationEnabled) { 'not-requested' }
+    elseif (-not $renderStatus.mediaGenerationEnabled) { 'not-rendered' }
+    elseif (-not $configStatus.merged) { 'config-unmerged' }
+    else {
+        $python = [string]$runtimeState.python.executable
+        if ($python -and (Test-Path -LiteralPath $python -PathType Leaf)) {
+            $result = & $python -B (Join-Path $PackRoot 'replace-pack-config.py') --media-registration $mediaConfigPath $mediaWrapperTarget
+            if ($LASTEXITCODE -eq 0 -and $result) { $result } else { 'check-unavailable' }
+        } else { 'check-unavailable' }
+    }
+$mediaRegistered = $mediaRegistration -eq 'registered'
 $connectionStatus = [ordered]@{
     schemaVersion = 1
     feishu = if (-not $feishuReady) { 'runtime-not-ready' } elseif ($feishuApplied -and -not $feishuHasCredentials) { 'enabled-awaiting-credentials' } elseif ($feishuApplied) { 'enabled-awaiting-tenant-health' } elseif ($feishuEnabled) { 'config-not-applied' } else { 'disabled' }
     mediaGeneration = [ordered]@{
         runtime = [string]$mediaHealthStatus.runtime
         protocol = [string]$mediaHealthStatus.protocol
+        registrationStatus = $mediaRegistration
         registered = $mediaRegistered
         enabled = $mediaRegistered
         gatewayCatalog = [string]$mediaHealthStatus.gatewayCatalog
@@ -805,7 +817,7 @@ Set-InstallProgress 'pack.finalize'
 $pdfReady = [string]$pdfSmokeStatus.status -eq 'passed'
 $configReady = [string]$configStatus.status -notin @('failed', 'partial', 'conflict')
 $modelReady = [string]$modelSyncStatus.status -eq 'ready'
-$overallStatus = if (-not $coreReady) { 'failed' } elseif ($runtimeReady -and [string]$runtimeState.status -eq 'ready' -and $pdfReady -and $configReady -and $modelReady) { 'ready' } else { 'partial' }
+$overallStatus = if (-not $coreReady) { 'failed' } elseif ($runtimeReady -and [string]$runtimeState.status -eq 'ready' -and $pdfReady -and $configReady -and $modelReady -and (-not $mediaGenerationEnabled -or $mediaRegistered)) { 'ready' } else { 'partial' }
 $diagnostics = [ordered]@{
     path = (Join-Path $diagnosticsRoot 'capability-pack.log')
     runtime = $runtimeDiagnosticPath
@@ -818,6 +830,7 @@ $diagnosticText = @(
     "runtime health=python:$([string]$runtimeState.python.health),manim:$([string]$runtimeState.manim.health),node:$([string]$runtimeState.node.health),ffmpeg:$([string]$runtimeState.ffmpeg.health),hyperframes-cli:$([string]$runtimeState.hyperframes.cliHealth),hyperframes-browser:$([string]$runtimeState.hyperframes.browserHealth),feishu:$([string]$runtimeState.feishu.health)",
     "pdf smoke status=$([string]$pdfSmokeStatus.status)",
     "config status=$([string]$configStatus.status)",
+    "media registration=$mediaRegistration",
     "model sync status=$([string]$modelSyncStatus.status) preferred=$([string]$modelSyncStatus.preferredModel) migration=$([string]$modelSyncStatus.migration)",
     "runtime log=$runtimeDiagnosticPath",
     "config log=$configDiagnosticPath"

@@ -17,7 +17,7 @@ $source=[IO.File]::ReadAllText((Join-Path $repo 'installer-pack\runtime\provisio
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'Provisioner parse error'}
-foreach($name in @('Test-PathWithin','Assert-Media','ConvertTo-WindowsArgument','Stop-NativeProcessTree','Invoke-NativeCapture','Get-NodeVersion','Write-AsciiFile')){
+foreach($name in @('Test-PathWithin','Assert-Media','ConvertTo-WindowsArgument','Stop-NativeProcessTree','Invoke-NativeCapture','Get-NodeVersion','Read-Json','Write-AsciiFile','Test-FeishuRuntime','Restore-FeishuRuntime','Expand-BundledZip')){
  . ([scriptblock]::Create($ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true).Extent.Text))
 }
 $packRootFull=Join-Path $repo 'installer-pack'
@@ -37,6 +37,12 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 # replace it when the first recovery calls the qualified real implementation.
 Import-Module Microsoft.PowerShell.Archive
 $script:inject=$false;$script:extractCalls=[Collections.Generic.List[string]]::new()
+$realZipExtractor = (Get-Command Expand-BundledZip).ScriptBlock
+function Expand-BundledZip($Zip,$Destination) {
+ if ($script:inject) { Expand-Archive -LiteralPath $Zip -DestinationPath $Destination -Force; return }
+ $script:extractCalls.Add([string]$Zip)
+ & $realZipExtractor $Zip $Destination
+}
 function Expand-Archive {
  param($LiteralPath,$DestinationPath,[switch]$Force)
  $script:extractCalls.Add([string]$LiteralPath)
@@ -77,6 +83,7 @@ $results.Add([ordered]@{case='feishu-disabled';extractions=0;existingFilesPreser
 
 foreach($case in @('node','ffmpeg','feishu')){
  $runtimeRoot=Join-Path $fixture ($case+'\runtime')
+ if ($case -in 'node','feishu') { $runtimeRoot = Join-Path (Join-Path $fixture ('n' * (137 - $fixture.Length))) 'runtime' }
  New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
  $EnableFeishu=$case -eq 'feishu'
  $block=switch($case){'node'{$nodeBlock};'ffmpeg'{$ffmpegBlock};'feishu'{$feishuBlock}}
@@ -87,6 +94,7 @@ foreach($case in @('node','ffmpeg','feishu')){
   $originalError=$feishuError
  }
  if(-not $originalError.StartsWith('Injected interruption')){throw "Expected original interruption missing: $case; actual=$originalError"}
+ if ($case -eq 'feishu') { $feishuCli=Join-Path $feishuRoot 'node_modules\@larksuiteoapi\lark-mcp\dist\cli.js' }
  $entry=switch($case){'node'{$nodeExe};'ffmpeg'{$ffprobeExe};'feishu'{$feishuCli}}
  $dependency=switch($case){'node'{Join-Path $nodeRoot 'node_modules\npm\bin\npm-cli.js'};'ffmpeg'{$ffplayExe};'feishu'{Join-Path $feishuRoot 'node_modules\dotenv\package.json'}}
  if(-not(Test-Path -LiteralPath $entry) -or (Test-Path -LiteralPath $dependency)){throw 'Actual archive did not produce the intended partial state'}
@@ -116,7 +124,7 @@ foreach($case in @('node','ffmpeg','feishu')){
   $record.health=$ffmpegHealth;$record.ffplay='passed';$record.videoCodec=$stream.codec_name;$record.video=$video
  } else {
   if($feishuHealth -ne 'passed'){throw 'Restored Feishu CLI not healthy'}
-  $record.health=$feishuHealth;$record.cliHelp=$mcpHelpResult.Output;$record.nodeExecutable=$nodeExe;$record.cli=$feishuCli
+  $record.health=$feishuHealth;$record.nodeExecutable=$nodeExe;$record.cli=$feishuCli
  }
  $results.Add($record)
  Write-Host "Actual recovery passed: $case"

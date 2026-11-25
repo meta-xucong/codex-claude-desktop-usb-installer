@@ -11,6 +11,8 @@ pub enum AppError {
     Engine(String),
     #[error("Claude desktop worker: {0}")]
     ClaudeDesktopWorker(String),
+    #[error("Claude 桌面部署：{0}")]
+    ClaudeDeployment(String),
     #[error("USB_HOST_NOT_READY: {0}。请打开管理器完成本机初始化后启动。")]
     UsbHostNotReady(String),
     /// Reality (installed bundle / feed target) no longer matches the snapshot
@@ -246,6 +248,7 @@ impl AppError {
             // message — instead of collapsing everything to `engine_error`.
             Self::Engine(message) => classify(message).as_code(),
             Self::ClaudeDesktopWorker(_) => "claude_desktop_worker",
+            Self::ClaudeDeployment(_) => "claude_deployment",
             Self::UsbHostNotReady(_) => "usb_host_not_ready",
             Self::StaleExpectation(_) => "stale_expectation",
             Self::Committed(_) => "post_commit_cleanup",

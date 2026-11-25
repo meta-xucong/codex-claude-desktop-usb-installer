@@ -69,7 +69,7 @@ fn confirmed_quit_policy_for(app: &tauri::AppHandle) -> QuitPolicy {
 /// Returns `true` when the caller should proceed to exit.
 fn apply_quit_policy(app: &tauri::AppHandle, policy: &QuitPolicy) -> bool {
     match policy {
-        QuitPolicy::Allow => true,
+        QuitPolicy::Allow => !hide_for_managed_claude(app),
         QuitPolicy::Confirm => {
             dispatch_shell_event(app, ShellEvent::ConfirmQuit);
             false
@@ -173,9 +173,21 @@ fn emit_shell_event(app: &tauri::AppHandle, event: &ShellEvent) {
     }
 }
 
+fn hide_for_managed_claude(_app: &tauri::AppHandle) -> bool {
+    #[cfg(windows)]
+    if crate::app::claude_session::keep_background() {
+        if let Some(window) = _app.get_webview_window("main") {
+            if let Err(e) = window.hide() { log::warn!("could not hide manager: {e}"); }
+        }
+        return true;
+    }
+    false
+}
+
 pub(crate) fn exit_after_confirm(app: &tauri::AppHandle) {
     let _ = codex_mac_engine::cancel_active_download();
     let _ = codex_win_engine::cancel_active_download();
+    if hide_for_managed_claude(app) { return; }
     crate::app::usb_guard::stop_for_manager();
     app.state::<state::ManagerState>()
         .force_quit
@@ -826,6 +838,7 @@ pub fn run() {
     // This read-only gate must precede WebView2/VC probing, logging, recovery,
     // lease creation and any automatic launch. A formal USB binary therefore
     // cannot perform prerequisite or recovery writes on an unlicensed medium.
+    let preflight_start = std::time::Instant::now();
     #[allow(unused_mut)]
     let mut usb_startup = match crate::app::usb_guard::startup_preflight() {
         Ok(result) => result,
@@ -852,6 +865,13 @@ pub fn run() {
             }
         };
     }
+    let preflight_ms = preflight_start.elapsed().as_millis();
+    let preflight_outcome = match &usb_startup {
+        crate::app::usb_guard::StartupPreflight::Ready => "ready",
+        crate::app::usb_guard::StartupPreflight::IntegrityPending { .. } => "integrity_pending",
+        crate::app::usb_guard::StartupPreflight::RevocationPending { .. } => "revocation_pending",
+        crate::app::usb_guard::StartupPreflight::AuthorizationBlocked { .. } => "blocked",
+    };
     #[cfg(target_os = "windows")]
     let usb_authorization_blocked = usb_startup.is_authorization_blocked();
     if let Some(reason) = usb_startup.reason() {
@@ -1024,6 +1044,8 @@ pub fn run() {
             commands::confirm_quit,
             commands::get_uninstall_handoff,
             commands::complete_uninstall_handoff,
+            commands::retry_uninstall_profile,
+            commands::dismiss_uninstall_profile_retry,
             commands::win_default_install_root,
             commands::win_pick_install_dir,
             commands::win_set_install_root,
@@ -1060,6 +1082,7 @@ pub fn run() {
             commands::usb_claude_open,
             commands::usb_claude_prepare,
             commands::usb_claude_sync_skills,
+            commands::usb_claude_check_update,
             commands::usb_claude_update,
             commands::win_adopt,
             commands::win_pick_existing_install,
@@ -1073,6 +1096,7 @@ pub fn run() {
             commands::media_model_catalog,
             commands::media_model_settings,
             commands::manage_native_model_catalog,
+            commands::manage_claude_models,
             commands::install_and_launch_ccswitch,
             commands::open_ccswitch,
             commands::account_status,
@@ -1106,6 +1130,7 @@ pub fn run() {
                 std::process::id(),
                 crate::app::usb_guard::now_ms()
             );
+            log::info!("USB check stage=preflight pid={} result={preflight_outcome} elapsed_ms={preflight_ms}", std::process::id());
             if let Some(run_id) = crate::app::paths::packaged_smoke_run_id() {
                 log::info!("packaged smoke run id={run_id} data_dir_isolated=true");
             }
@@ -1121,12 +1146,12 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             let recovery_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
-                // The complete USB SHA/AuthentiCode walk is intentionally
+                // USB startup verification runs intentionally
                 // outside Tauri setup. The local shell can render first, but
                 // this worker remains the only place that creates the lease,
                 // starts recovery, or enables any protected action.
                 #[cfg(target_os = "windows")]
-                let usb_startup_ready = match crate::app::usb_guard::start_for_manager() {
+                let usb_startup_ready = match crate::app::usb_guard::start_for_manager_on_open() {
                     Ok(status) => {
                         let ready = !crate::app::usb_guard::guard_required()
                             || status.codex_allowed;
